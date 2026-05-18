@@ -280,6 +280,14 @@ fn genie_ai_runtime_service_preserves_model_page_cache() {
         contents.contains("page cache") && contents.contains("issue #69"),
         "service should document why page cache is preserved"
     );
+    assert!(
+        contents.contains("--int8-kv"),
+        "genie-ai-runtime.service should use INT8 KV to fit enough context under memory pressure"
+    );
+    assert!(
+        contents.contains("GENIEPOD_AI_RUNTIME_CONTEXT=2048"),
+        "genie-ai-runtime.service should request the GenieClaw web-chat context size"
+    );
 }
 
 /// Verify the model cache helper can inspect GGUF page-cache residency.
