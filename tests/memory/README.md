@@ -7,11 +7,32 @@ failures are observable, not silent. Tracks M1 exit criterion from
 ## Layout
 
 - `cases.toml` — the case definitions. One `[[case]]` table per scenario.
-- `expected/` — written by the runner. Contains the latest pass/fail ledger
-  (`ledger.json`) so a reviewer can see which case failed without re-running.
+- `expected/ledger.json` — **golden fixture**. The committed file is the
+  expected ledger; the runner serializes the in-memory ledger and
+  compares it against this file (with CRLF normalised). The runner does
+  **not** write into the tracked tree.
 
 The runner lives at `crates/genie-core/tests/memory_recall.rs` and is exercised
-by `cargo test -p genie-core --test memory_recall`.
+by `cargo test -p genie-core --test memory_recall`. Its only filesystem
+output is `target/memory-recall-ledger.json`, in Cargo's gitignored build
+directory.
+
+## Regenerating the golden ledger
+
+When you intentionally change anything that affects the ledger output —
+adding a case, editing a description, changing an `expect.outcome` —
+the runner fails with a drift error pointing at the freshly generated
+ledger under `target/`. To accept the new ledger:
+
+```sh
+cargo test -p genie-core --test memory_recall   # fails with drift hint
+cp target/memory-recall-ledger.json tests/memory/expected/ledger.json
+cargo test -p genie-core --test memory_recall   # now green
+git add tests/memory/expected/ledger.json
+```
+
+The two-step ensures every fixture change appears as a reviewable diff
+in the PR.
 
 ## What a case proves
 
@@ -29,5 +50,8 @@ restart — the M1 "next session" requirement — without spinning a binary.
 
 ## Acceptance gate
 
-The runner asserts ≥ 95 % pass across all cases and writes
-`tests/memory/expected/ledger.json` for the closing PR.
+The runner asserts ≥ 95 % pass across all cases and then compares the
+in-memory ledger against `expected/ledger.json`. The first assertion
+catches recall regressions; the second catches subtler ledger drift
+(e.g. a case that moved from `hit` to `filtered` while keeping the
+overall pass rate above the floor).

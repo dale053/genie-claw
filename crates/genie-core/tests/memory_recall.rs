@@ -2,9 +2,15 @@
 //
 // Loads `tests/memory/cases.toml` from the workspace root, exercises each
 // case against `genie_core::memory::Memory` + `recall::recall_with_context`,
-// and asserts the test set passes >= 95%. Writes a ledger artifact at
-// `tests/memory/expected/ledger.json` so the closing PR can attach the
-// reviewer-readable hit/miss table.
+// and asserts the test set passes >= 95%.
+//
+// The committed `tests/memory/expected/ledger.json` is a **golden fixture**.
+// The runner serializes the in-memory ledger and compares it against the
+// fixture; a drift means either a real regression or an intentional change
+// that needs the fixture regenerated. The runner never writes into the
+// tracked tree — the generated ledger goes to `target/memory-recall-ledger.json`
+// (Cargo's standard build directory) so a contributor can `cp` it over the
+// fixture when the drift is intentional.
 //
 // Two narrower tests at the bottom of this file pin the structured-log
 // behaviour: a no_match recall and a policy_filtered recall must each emit
@@ -152,7 +158,12 @@ fn memory_recall_test_set_meets_95_percent_floor() {
         entries,
     };
 
-    write_ledger(&ledger);
+    // Write the generated ledger to Cargo's ignored build directory so a
+    // contributor can inspect it without re-running and `cp` it onto the
+    // golden fixture when a drift is intentional. This is the only place
+    // the runner writes — never into the tracked tree.
+    let actual_path = write_debug_ledger(&ledger);
+    let actual_text = serde_json::to_string_pretty(&ledger).expect("serialize ledger");
 
     // Echo failures so the test output points at the right case without
     // requiring a separate cargo invocation.
@@ -175,6 +186,47 @@ fn memory_recall_test_set_meets_95_percent_floor() {
         passed,
         total
     );
+
+    // Integrity check: the in-memory ledger must match the committed
+    // golden fixture verbatim. A drift here means either a recall
+    // regression that snuck past the pass-rate floor (e.g. a case moved
+    // from `hit` -> `filtered`, raw_hits changed), or an intentional
+    // change (new case added, description edited) that needs the fixture
+    // regenerated.
+    let golden_path = workspace_root()
+        .join("tests")
+        .join("memory")
+        .join("expected")
+        .join("ledger.json");
+    let golden_text = std::fs::read_to_string(&golden_path).unwrap_or_else(|e| {
+        panic!(
+            "golden fixture {} missing or unreadable ({}). The committed file is the expected ledger; regenerate by copying {} on top of it.",
+            golden_path.display(),
+            e,
+            actual_path.display(),
+        )
+    });
+
+    if normalize_ledger(&actual_text) != normalize_ledger(&golden_text) {
+        panic!(
+            "memory recall ledger drifted from {}.\n\
+             Generated ledger written to {}.\n\
+             If the drift is intentional (e.g. you added a case, edited a description, or changed expected outcomes), regenerate the fixture:\n\
+             \n    cp {} {}\n\
+             \nand commit the result.",
+            golden_path.display(),
+            actual_path.display(),
+            actual_path.display(),
+            golden_path.display(),
+        );
+    }
+}
+
+fn normalize_ledger(text: &str) -> String {
+    // Tolerate CRLF in case a Windows checkout normalized line endings,
+    // and strip trailing whitespace so an editor-added final newline
+    // does not register as a drift.
+    text.replace("\r\n", "\n").trim_end().to_string()
 }
 
 fn run_case(case: &Case) -> LedgerEntry {
@@ -251,24 +303,26 @@ fn run_case(case: &Case) -> LedgerEntry {
     }
 }
 
-fn write_ledger(ledger: &Ledger) {
-    let dir = workspace_root()
-        .join("tests")
-        .join("memory")
-        .join("expected");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("ledger dir create failed: {e}");
-        return;
+/// Write the generated ledger to Cargo's `target/` directory for local
+/// inspection. `target/` is the standard Cargo build output and is
+/// gitignored, so this never mutates the tracked tree. Returns the path
+/// so the main test can include it in a drift error message.
+fn write_debug_ledger(ledger: &Ledger) -> PathBuf {
+    let path = workspace_root()
+        .join("target")
+        .join("memory-recall-ledger.json");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
-    let path = dir.join("ledger.json");
     match serde_json::to_string_pretty(ledger) {
         Ok(text) => {
             if let Err(e) = std::fs::write(&path, text) {
-                eprintln!("ledger write {}: {}", path.display(), e);
+                eprintln!("debug ledger write {}: {}", path.display(), e);
             }
         }
-        Err(e) => eprintln!("ledger serialize: {e}"),
+        Err(e) => eprintln!("debug ledger serialize: {e}"),
     }
+    path
 }
 
 // ---------------------------------------------------------------------------
