@@ -3,6 +3,7 @@
 # Usage:
 #   make                       Build debug binaries (x86_64)
 #   make test                  Run all tests
+#   make soak-selfcheck        Validate the issue #113 soak analyzer (no hardware)
 #   make release               Build optimized x86_64 binaries
 #   make jetson                Cross-compile release for aarch64 (Jetson)
 #   make deploy                Deploy to Jetson devkit via SSH
@@ -18,6 +19,7 @@
 
 JETSON_HOST ?= geniepod.local
 JETSON_USER ?= geniepod
+PYTHON ?= python3
 JETSON_TARGET = $(JETSON_USER)@$(JETSON_HOST)
 AARCH64 = aarch64-unknown-linux-gnu
 GENIE_CORE_FEATURES ?=
@@ -29,7 +31,7 @@ RELEASE_DIR = target/release
 CROSS_DIR = target/$(AARCH64)/release
 INSTALL_DIR = /opt/geniepod
 
-.PHONY: all build test release jetson deploy deploy-config deploy-systemd clean check fmt jetson-ai-runtime
+.PHONY: all build test release jetson deploy deploy-config deploy-systemd clean check fmt jetson-ai-runtime soak-selfcheck
 
 # ── Development ─────────────────────────────────────────────────
 
@@ -43,6 +45,11 @@ check:
 
 test:
 	cargo test
+
+# Score the committed example fixture and assert the soak analyzer's verdicts
+# (issue #113). Hardware-free — exercises tests/soak/analyze_soak.py end to end.
+soak-selfcheck:
+	$(PYTHON) tests/soak/analyze_soak.py --self-check
 
 fmt:
 	cargo fmt --all

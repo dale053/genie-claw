@@ -1,0 +1,4 @@
+2026-05-20T12:00:01Z geniepod systemd[1]: Started GeniePod AI Runtime.
+2026-05-20T12:00:02Z geniepod jetson-llm-server[812]: model loaded, ctx=4096
+2026-05-20T12:15:00Z geniepod jetson-llm-server[812]: served 30 requests, kv ok
+2026-05-20T12:30:00Z geniepod jetson-llm-server[812]: served 60 requests, kv ok

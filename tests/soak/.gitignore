@@ -1,0 +1,7 @@
+# Soak run output lands here; real-run artifacts are committed deliberately,
+# not swept in wholesale. See README.md.
+runs/
+
+# Python bytecode caches.
+__pycache__/
+*.pyc

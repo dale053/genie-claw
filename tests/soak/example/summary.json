@@ -1,0 +1,57 @@
+{
+  "telemetry": "telemetry.jsonl",
+  "records": 60,
+  "span_hours": 2.0,
+  "overall": "PASS",
+  "criteria": [
+    {
+      "name": "24h continuous uptime, zero runtime restarts",
+      "status": "PASS",
+      "detail": "2.00h continuous, 0 runtime restarts",
+      "span_hours": 2.0,
+      "restarts": 0
+    },
+    {
+      "name": "Zero OOM kills (dmesg/journal clean)",
+      "status": "PASS",
+      "detail": "no OOM markers found",
+      "hits": []
+    },
+    {
+      "name": "/api/health reports genie-ai-runtime reachable >= 99% of samples",
+      "status": "PASS",
+      "detail": "60/60 reachable (100.00% >= 99%)",
+      "samples": 60,
+      "reachable": 60,
+      "ratio": 1.0
+    },
+    {
+      "name": "No memory monotonic growth (RSS plateaus, not creeps)",
+      "status": "PASS",
+      "detail": "median first-decile=1606731767, last-decile=1607479160 (+0.0%, slope -161877.1/h) via runtime_rss_bytes",
+      "source": "runtime_rss_bytes",
+      "growth_frac": 0.0005,
+      "slope_per_hour": -161877.108
+    },
+    {
+      "name": "First-token latency p50/p99 within budget at hours 1, 12, 24",
+      "status": "PASS",
+      "detail": "within budget at h1",
+      "budget_p50_ms": 1500.0,
+      "budget_p99_ms": 4000.0,
+      "windows": {
+        "1": {
+          "n": 31,
+          "p50_ms": 426.0,
+          "p99_ms": 479.4
+        }
+      }
+    },
+    {
+      "name": "Soak telemetry artifact present under tests/soak/",
+      "status": "PASS",
+      "detail": "60 telemetry records parsed from telemetry.jsonl",
+      "records": 60
+    }
+  ]
+}
