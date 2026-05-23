@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use super::openai_compat::OpenAiCompatClient;
-use super::{LlmBackendClient, Message, ResponseFormat};
+use super::{LlmBackendClient, LlmRequestHints, Message, ResponseFormat};
 
 /// llama.cpp `--server` adapter for the OpenAI-compatible chat API.
 pub struct LlamaCppBackend {
@@ -44,12 +44,36 @@ impl LlmBackendClient for LlamaCppBackend {
             .await
     }
 
+    async fn chat_with_format_and_hints(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        response_format: Option<ResponseFormat>,
+        hints: Option<&LlmRequestHints>,
+    ) -> Result<String> {
+        let _ = hints;
+        self.inner
+            .chat_with_format(messages, max_tokens, response_format)
+            .await
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
         max_tokens: Option<u32>,
         on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> Result<String> {
+        self.inner.chat_stream(messages, max_tokens, on_token).await
+    }
+
+    async fn chat_stream_with_hints(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        hints: Option<&LlmRequestHints>,
+        on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<String> {
+        let _ = hints;
         self.inner.chat_stream(messages, max_tokens, on_token).await
     }
 }

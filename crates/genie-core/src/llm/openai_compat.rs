@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+use super::LlmRequestHints;
+
 /// Raw HTTP client for local OpenAI-compatible chat completion backends.
 ///
 /// Supports both blocking completion and streaming (SSE).
@@ -36,11 +38,42 @@ pub(crate) struct ChatRequest {
     pub(crate) temperature: Option<f32>,
     pub(crate) stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) conversation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) think: Option<bool>,
     /// JSON schema constraint for backends that support OpenAI-compatible
     /// `response_format`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) response_format: Option<ResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) nvext: Option<NvExt>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NvExt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_hints: Option<AgentHints>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_control: Option<CacheControl>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AgentHints {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) priority: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) osl: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) speculative_prefill: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CacheControl {
+    #[serde(rename = "type")]
+    pub(crate) cache_type: &'static str,
+    pub(crate) ttl: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,8 +146,10 @@ impl RequestProfile {
         max_tokens: Option<u32>,
         stream: bool,
         response_format: Option<ResponseFormat>,
+        hints: Option<&LlmRequestHints>,
     ) -> Result<PreparedChatBody> {
-        let body = self.serialize_body(messages, max_tokens, stream, response_format.clone())?;
+        let body =
+            self.serialize_body(messages, max_tokens, stream, response_format.clone(), hints)?;
         if !matches!(self, Self::GenieAiRuntime) || body.len() <= GENIE_RUNTIME_MAX_BODY_BYTES {
             return Ok(PreparedChatBody {
                 body,
@@ -123,8 +158,13 @@ impl RequestProfile {
         }
 
         let compacted_messages = self.compact_messages(messages, GENIE_RUNTIME_MAX_BODY_BYTES);
-        let compacted_body =
-            self.serialize_body(&compacted_messages, max_tokens, stream, response_format)?;
+        let compacted_body = self.serialize_body(
+            &compacted_messages,
+            max_tokens,
+            stream,
+            response_format,
+            hints,
+        )?;
         Ok(PreparedChatBody {
             body: compacted_body,
             compacted: true,
@@ -137,15 +177,19 @@ impl RequestProfile {
         max_tokens: Option<u32>,
         stream: bool,
         response_format: Option<ResponseFormat>,
+        hints: Option<&LlmRequestHints>,
     ) -> Result<String> {
+        let conversation_id = self.runtime_session_id(hints);
         let request = ChatRequest {
             model: self.model().into(),
             messages: messages.to_vec(),
             max_tokens,
             temperature: Some(0.7),
             stream,
+            conversation_id,
             think: self.think_override(),
             response_format,
+            nvext: self.nvext(hints),
         };
         Ok(serde_json::to_string(&request)?)
     }
@@ -168,6 +212,22 @@ impl RequestProfile {
         match self {
             Self::Generic => messages.to_vec(),
             Self::GenieAiRuntime => compact_genie_runtime_messages(messages, max_body_bytes),
+        }
+    }
+
+    fn runtime_session_id(&self, hints: Option<&LlmRequestHints>) -> Option<String> {
+        match self {
+            Self::Generic => None,
+            Self::GenieAiRuntime => hints
+                .and_then(|h| h.session_id.as_deref())
+                .and_then(normalize_runtime_session_id),
+        }
+    }
+
+    fn nvext(&self, hints: Option<&LlmRequestHints>) -> Option<NvExt> {
+        match self {
+            Self::Generic => None,
+            Self::GenieAiRuntime => hints.and_then(build_nvext),
         }
     }
 }
@@ -263,9 +323,55 @@ impl OpenAiCompatClient {
         max_tokens: Option<u32>,
         response_format: Option<ResponseFormat>,
     ) -> Result<String> {
-        let prepared =
-            self.request_profile
-                .prepare_body(messages, max_tokens, false, response_format)?;
+        let prepared = self.request_profile.prepare_body(
+            messages,
+            max_tokens,
+            false,
+            response_format,
+            None,
+        )?;
+        self.chat_with_prepared_body(prepared).await
+    }
+
+    pub async fn chat_with_format_and_hints(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        response_format: Option<ResponseFormat>,
+        hints: Option<&LlmRequestHints>,
+    ) -> Result<String> {
+        match self
+            .chat_with_format_once_and_hints(messages, max_tokens, response_format.clone(), hints)
+            .await
+        {
+            Ok(content) => Ok(content),
+            Err(err) if should_retry_without_system_role(messages, &err.to_string()) => {
+                let flattened = flatten_system_into_first_user(messages);
+                self.chat_with_format_once_and_hints(&flattened, max_tokens, response_format, hints)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn chat_with_format_once_and_hints(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        response_format: Option<ResponseFormat>,
+        hints: Option<&LlmRequestHints>,
+    ) -> Result<String> {
+        let prepared = self.request_profile.prepare_body(
+            messages,
+            max_tokens,
+            false,
+            response_format,
+            hints,
+        )?;
+        self.chat_with_prepared_body(prepared).await
+    }
+
+    async fn chat_with_prepared_body(&self, prepared: PreparedChatBody) -> Result<String> {
         if prepared.compacted {
             tracing::debug!(
                 backend = self.backend_name,
@@ -321,7 +427,30 @@ impl OpenAiCompatClient {
     ) -> Result<String> {
         let prepared = self
             .request_profile
-            .prepare_body(messages, max_tokens, true, None)?;
+            .prepare_body(messages, max_tokens, true, None, None)?;
+        self.chat_stream_with_prepared_body(prepared, on_token)
+            .await
+    }
+
+    pub async fn chat_stream_with_hints(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        hints: Option<&LlmRequestHints>,
+        on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<String> {
+        let prepared = self
+            .request_profile
+            .prepare_body(messages, max_tokens, true, None, hints)?;
+        self.chat_stream_with_prepared_body(prepared, on_token)
+            .await
+    }
+
+    async fn chat_stream_with_prepared_body(
+        &self,
+        prepared: PreparedChatBody,
+        on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<String> {
         if prepared.compacted {
             tracing::debug!(
                 backend = self.backend_name,
@@ -500,6 +629,67 @@ impl OpenAiCompatClient {
 
         tokio::io::AsyncReadExt::read_to_string(&mut buf_reader, &mut body).await?;
         Ok(HttpResponse { status, body })
+    }
+}
+
+fn build_nvext(hints: &LlmRequestHints) -> Option<NvExt> {
+    let session_id = hints
+        .session_id
+        .as_deref()
+        .and_then(normalize_runtime_session_id);
+    let agent_hints = if session_id.is_some()
+        || hints.priority.is_some()
+        || hints.output_sequence_length.is_some()
+        || hints.speculative_prefill
+    {
+        Some(AgentHints {
+            session_id,
+            priority: hints.priority,
+            osl: hints.output_sequence_length,
+            speculative_prefill: hints.speculative_prefill.then_some(true),
+        })
+    } else {
+        None
+    };
+
+    let cache_control = hints.cache_ttl_secs.map(|ttl| CacheControl {
+        cache_type: "ephemeral",
+        ttl: format_ttl(ttl),
+    });
+
+    if agent_hints.is_some() || cache_control.is_some() {
+        Some(NvExt {
+            agent_hints,
+            cache_control,
+        })
+    } else {
+        None
+    }
+}
+
+fn normalize_runtime_session_id(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len().min(64));
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+        if out.len() == 64 {
+            break;
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn format_ttl(secs: u32) -> String {
+    if secs >= 3600 && secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
     }
 }
 
@@ -797,12 +987,75 @@ mod tests {
             max_tokens: Some(256),
             temperature: Some(0.7),
             stream: false,
+            conversation_id: None,
             think: None,
             response_format: None,
+            nvext: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("nemotron-4b"));
         assert!(json.contains("turn on the lights"));
+    }
+
+    #[test]
+    fn generic_request_profile_omits_runtime_hints() {
+        let profile = RequestProfile::generic();
+        let hints = LlmRequestHints::agent_turn("conv-abc", 256);
+        let prepared = profile
+            .prepare_body(
+                &[Message {
+                    role: "user".into(),
+                    content: "hello".into(),
+                }],
+                Some(64),
+                false,
+                None,
+                Some(&hints),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
+
+        assert!(json.get("conversation_id").is_none());
+        assert!(json.get("nvext").is_none());
+    }
+
+    #[test]
+    fn genie_runtime_profile_serializes_session_and_cache_hints() {
+        let profile = RequestProfile::genie_ai_runtime();
+        let hints = LlmRequestHints::agent_turn("conv-abc", 512);
+        let prepared = profile
+            .prepare_body(
+                &[Message {
+                    role: "user".into(),
+                    content: "turn on the lights".into(),
+                }],
+                Some(512),
+                false,
+                None,
+                Some(&hints),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
+
+        assert_eq!(json["conversation_id"], "conv-abc");
+        assert_eq!(json["nvext"]["agent_hints"]["session_id"], "conv-abc");
+        assert_eq!(json["nvext"]["agent_hints"]["priority"], 50);
+        assert_eq!(json["nvext"]["agent_hints"]["osl"], 512);
+        assert_eq!(json["nvext"]["cache_control"]["type"], "ephemeral");
+        assert_eq!(json["nvext"]["cache_control"]["ttl"], "15m");
+    }
+
+    #[test]
+    fn runtime_session_ids_are_sanitized_for_cache_files() {
+        assert_eq!(
+            normalize_runtime_session_id("voice/session 1").as_deref(),
+            Some("voice_session_1")
+        );
+        assert_eq!(normalize_runtime_session_id("///"), None);
+        assert_eq!(
+            normalize_runtime_session_id(&"x".repeat(80)).unwrap().len(),
+            64
+        );
     }
 
     #[test]
@@ -820,7 +1073,7 @@ mod tests {
         ];
 
         let prepared = profile
-            .prepare_body(&messages, Some(64), false, None)
+            .prepare_body(&messages, Some(64), false, None, None)
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
 
@@ -856,7 +1109,7 @@ mod tests {
         ];
 
         let prepared = profile
-            .prepare_body(&messages, Some(64), false, None)
+            .prepare_body(&messages, Some(64), false, None, None)
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
         let serialized_messages = json["messages"].to_string();
@@ -889,7 +1142,7 @@ mod tests {
         ];
 
         let prepared = profile
-            .prepare_body(&messages, Some(64), false, None)
+            .prepare_body(&messages, Some(64), false, None, None)
             .unwrap();
         let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
         let serialized_messages = json["messages"].to_string();

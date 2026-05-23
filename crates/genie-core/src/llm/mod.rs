@@ -30,12 +30,72 @@ pub trait LlmBackendClient: Send + Sync {
         response_format: Option<ResponseFormat>,
     ) -> Result<String>;
 
+    async fn chat_with_format_and_hints(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        response_format: Option<ResponseFormat>,
+        hints: Option<&LlmRequestHints>,
+    ) -> Result<String> {
+        let _ = hints;
+        self.chat_with_format(messages, max_tokens, response_format)
+            .await
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
         max_tokens: Option<u32>,
         on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> Result<String>;
+
+    async fn chat_stream_with_hints(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        hints: Option<&LlmRequestHints>,
+        on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<String> {
+        let _ = hints;
+        self.chat_stream(messages, max_tokens, on_token).await
+    }
+}
+
+/// Harness-visible inference metadata for cache-aware local runtimes.
+///
+/// This mirrors the small Dynamo-style surface that matters to GenieClaw:
+/// stable session identity, expected output length, request priority, and
+/// short-lived cache retention. Generic backends ignore it; `genie-ai-runtime`
+/// serializes it as `conversation_id` plus `nvext.agent_hints`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LlmRequestHints {
+    pub session_id: Option<String>,
+    pub priority: Option<i32>,
+    pub output_sequence_length: Option<u32>,
+    pub speculative_prefill: bool,
+    pub cache_ttl_secs: Option<u32>,
+}
+
+impl LlmRequestHints {
+    pub fn agent_turn(session_id: impl Into<String>, output_sequence_length: u32) -> Self {
+        Self {
+            session_id: Some(session_id.into()),
+            priority: Some(50),
+            output_sequence_length: Some(output_sequence_length),
+            speculative_prefill: false,
+            cache_ttl_secs: Some(15 * 60),
+        }
+    }
+
+    pub fn tool_summary(session_id: impl Into<String>, output_sequence_length: u32) -> Self {
+        Self {
+            session_id: Some(session_id.into()),
+            priority: Some(30),
+            output_sequence_length: Some(output_sequence_length),
+            speculative_prefill: false,
+            cache_ttl_secs: Some(2 * 60),
+        }
+    }
 }
 
 /// LLM client facade used by agent orchestration.
@@ -135,6 +195,28 @@ impl LlmClient {
             .await
     }
 
+    pub async fn chat_with_hints(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        hints: &LlmRequestHints,
+    ) -> Result<String> {
+        self.chat_with_format_and_hints(messages, max_tokens, None, Some(hints))
+            .await
+    }
+
+    pub async fn chat_with_format_and_hints(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        response_format: Option<ResponseFormat>,
+        hints: Option<&LlmRequestHints>,
+    ) -> Result<String> {
+        self.backend
+            .chat_with_format_and_hints(messages, max_tokens, response_format, hints)
+            .await
+    }
+
     pub async fn chat_stream<F>(
         &self,
         messages: &[Message],
@@ -146,6 +228,21 @@ impl LlmClient {
     {
         self.backend
             .chat_stream(messages, max_tokens, &mut on_token)
+            .await
+    }
+
+    pub async fn chat_stream_with_hints<F>(
+        &self,
+        messages: &[Message],
+        max_tokens: Option<u32>,
+        hints: &LlmRequestHints,
+        mut on_token: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) + Send,
+    {
+        self.backend
+            .chat_stream_with_hints(messages, max_tokens, Some(hints), &mut on_token)
             .await
     }
 }
