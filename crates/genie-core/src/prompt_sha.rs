@@ -144,7 +144,10 @@ mod tests {
 
     #[test]
     fn same_input_is_deterministic_and_differs_on_change() {
-        assert_eq!(sha256_hex("identical prompt"), sha256_hex("identical prompt"));
+        assert_eq!(
+            sha256_hex("identical prompt"),
+            sha256_hex("identical prompt")
+        );
         assert_ne!(sha256_hex("prompt one"), sha256_hex("prompt two"));
     }
 }
