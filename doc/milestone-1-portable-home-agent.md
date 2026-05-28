@@ -29,6 +29,8 @@ machines while preserving the final Jetson appliance shape.
 
 - GenieClaw remains a home automation AI agent, not a broad chatbot shell.
 - Jetson remains the default flagship target.
+- Raspberry Pi and generic portable SBC profiles remain maintained targets for
+  the headless agent, memory, tools, HTTP/CLI, and home-provider boundaries.
 - The full default-feature build must continue to represent the original
   GeniePod Home goal: local runtime, voice, home control, family memory, safety,
   audit, and `genie-ai-runtime` integration.
@@ -50,8 +52,8 @@ The project should name and test distinct runtime profiles.
 | Profile | Purpose |
 | --- | --- |
 | `geniepod-full` | Flagship deployment: Jetson, `genie-ai-runtime`, voice, home automation, family memory, safety, and audit. |
-| `portable-home` | Development and non-Jetson installs: Home Assistant or fake home runtime, optional API-compatible LLM provider for validation only, headless or local UI. |
-| `headless-agent` | No audio stack. Runs HTTP/chat/tool APIs and agent behavior for servers, laptops, CI, and SBCs. |
+| `portable-home` | Maintained non-Jetson installs: Home Assistant or fake home runtime, optional API-compatible LLM provider for validation only, headless or local UI. |
+| `headless-agent` | No audio stack. Runs HTTP/chat/tool APIs and agent behavior for servers, laptops, CI, Raspberry Pi, and generic SBCs. |
 | `contributor-ci` | Deterministic validation profile: mock LLM, fake home automation, fixed memory fixtures, no hardware or API keys. |
 
 These profiles are validation and packaging tools. They do not change the

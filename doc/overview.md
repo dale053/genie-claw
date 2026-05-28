@@ -8,6 +8,8 @@ broader Genie ecosystem.
 The repo is optimized around a narrow goal:
 
 - run locally on Jetson-class hardware as the flagship target
+- maintain Raspberry Pi and generic portable SBC profiles for the headless
+  agent, memory, tools, HTTP/CLI, and home-provider boundaries
 - preserve a 4096-token small-context baseline before larger adaptive contexts
 - favor low latency over larger default context windows
 - tune accuracy through family memory, current home state, and typed tools
@@ -37,6 +39,11 @@ This repository is `genie-claw`. It integrates with external lower runtimes
 through narrow clients: `genie-ai-runtime` is the Jetson default LLM backend,
 `llama.cpp` remains a selectable development/fallback backend, and Home
 Assistant is the current transitional home provider.
+
+The Jetson profile is the native product path. The `raspberry_pi` and
+`portable_sbc` profiles are maintained compatibility targets for smaller
+on-device installs where Jetson-only voice, CUDA, or service behavior may be
+absent.
 
 The intended accuracy path is a compact home context harness: identity and
 family facts, relevant memories, device graph slices, recent actions, and

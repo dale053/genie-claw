@@ -5,6 +5,10 @@ data_dir = "/opt/geniepod/data"
 
 [agent]
 runtime_profile = "jetson"        # "jetson", "raspberry_pi", "portable_sbc", "laptop", or "mac".
+                                  # Jetson is flagship; raspberry_pi and
+                                  # portable_sbc are maintained headless/SBC
+                                  # profiles for agent, memory, tools, and
+                                  # home-provider boundaries.
 context_window_tokens = 4096      # Non-negotiable Jetson baseline before any adaptive larger context.
 ai_runtime_boundary = "external_runtime"       # genie-ai-runtime owns inference.
 voice_runtime_boundary = "transitional_adapter" # In-repo voice path is temporary; target is genie-voice-runtime.

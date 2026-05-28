@@ -11,6 +11,12 @@ prompts to a bigger remote model.
 
 The flagship target is GeniePod Home on Jetson-class hardware.
 
+Raspberry Pi and generic portable SBC profiles are maintained as smaller
+deployment and validation targets. They do not need to expose every
+Jetson-specific voice, CUDA, or model-runtime feature, but they should keep the
+headless agent, family memory, tools, HTTP/CLI surfaces, and home-runtime
+boundaries usable.
+
 The agent should:
 
 - answer quickly on local hardware
@@ -20,6 +26,7 @@ The agent should:
 - control IoT devices through typed local interfaces
 - degrade gracefully without the internet
 - expose audit, confirmation, and memory-management surfaces to the household
+- preserve the same limited-context contract across maintained SBC profiles
 
 Cloud or remote model providers are not the product default. OpenAI-compatible
 API providers, OpenAI, Anthropic, Gemini, custom providers, and similar adapters

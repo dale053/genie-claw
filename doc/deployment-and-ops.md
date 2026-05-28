@@ -56,6 +56,26 @@ The practical reason is simple:
 
 ## Supported Bring-Up Styles
 
+### Maintained SBC Profiles
+
+Jetson remains the flagship deployment target, but Raspberry Pi and generic
+portable SBC profiles are maintained for the headless agent path.
+
+Maintained means these surfaces should remain usable without Jetson-only
+assumptions:
+
+- config loading with `[agent].runtime_profile = "raspberry_pi"` or
+  `"portable_sbc"`
+- `genie-core` HTTP/chat surfaces
+- `genie-ctl` CLI surfaces
+- memory and tool routing
+- Home Assistant or fake home-provider boundaries
+- optional provider/test harness paths
+
+Voice, CUDA acceleration, `genie-ai-runtime`, and Jetson-specific systemd
+behavior may be unavailable or replaced by lighter local services on those
+profiles.
+
 ### Dev Machine
 
 Use `deploy/config/geniepod.dev.toml` and point `genie-core` at any local

@@ -202,20 +202,23 @@ The agent may propose or request actions. The home runtime decides whether physi
 
 ## Portable Profiles
 
-GenieClaw supports portable development without changing the native product
+GenieClaw supports maintained SBC profiles without changing the native product
 shape. `[agent].runtime_profile` describes where the same agent harness is
 running:
 
 | Profile | Purpose |
 | --- | --- |
 | `jetson` | Flagship GeniePod Home path; 4096-token baseline and local runtime default |
-| `raspberry_pi` | SBC development profile for headless agent and provider work |
-| `portable_sbc` | Generic SBC profile where voice/home runtimes may be absent |
+| `raspberry_pi` | Maintained SBC profile for the headless agent, memory, tools, HTTP/CLI, and home-provider boundaries |
+| `portable_sbc` | Maintained generic SBC profile where voice, CUDA, and full home runtimes may be absent |
 | `laptop` | Developer profile for local tests, docs, and provider integration |
 | `mac` | macOS developer profile; no Jetson-specific runtime assumptions |
 
-Profiles do not change ownership. They only make the same limited-context agent
-contract portable enough for development and review on non-Jetson hardware.
+Profiles do not change ownership. They keep the same limited-context agent
+contract portable enough for development, review, and maintained non-Jetson SBC
+deployments. Jetson-only acceleration and voice/audio behavior may degrade or
+be disabled, but prompt, memory, tools, safety policy, and home-runtime
+boundaries should keep working.
 
 ## Optional Providers
 

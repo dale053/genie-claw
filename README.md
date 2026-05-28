@@ -4,8 +4,8 @@
 [![Jetson cross-compile](https://github.com/GeniePod/genie-claw/actions/workflows/cross.yml/badge.svg)](https://github.com/GeniePod/genie-claw/actions/workflows/cross.yml)
 [![Audit](https://github.com/GeniePod/genie-claw/actions/workflows/audit.yml/badge.svg)](https://github.com/GeniePod/genie-claw/actions/workflows/audit.yml)
 
-**Low-latency, limited-context AI harness for private on-device homes: portable
-across SBCs and native to GeniePod Home.**
+**Low-latency, limited-context AI harness for private on-device homes: native to
+GeniePod Home and maintained across SBC profiles.**
 
 GenieClaw is the Rust agent layer for GeniePod Home. It is built for small local
 models, tight VRAM budgets, and a 4096-token Jetson baseline. This repo owns
@@ -23,6 +23,13 @@ The default agent contract is intentionally small: the Jetson profile uses
 `[agent].context_window_tokens = 4096`. Larger adaptive contexts can exist for
 stronger models, but provider/runtime paths must pass the 4096-token harness
 first.
+
+Jetson remains the flagship GeniePod Home target, but SBC support is maintained
+as part of the product architecture. The `raspberry_pi` and `portable_sbc`
+profiles must continue to run the headless agent, memory, tools, HTTP/CLI
+surfaces, and home-provider boundaries without assuming Jetson-only voice,
+CUDA, or systemd behavior. Hardware-specific features may be absent on those
+profiles, but the agent contract should remain usable and testable.
 
 ## Boundary
 
@@ -75,7 +82,7 @@ Current workspace version: `v1.0.0-alpha.9`.
 - split long-term wake/VAD/STT/TTS ownership into `genie-voice-runtime`
 - keep Home Assistant behind a provider boundary until `genie-home-runtime`
 - use optional API/OAuth providers only for testing, development portability, and transitional validation
-- keep development usable on SBCs, laptops, and Macs without making Jetson less native
+- keep maintained SBC profiles, laptops, and Macs usable without making Jetson less native
 
 ## Agent Contract
 
@@ -89,7 +96,7 @@ The repo now has explicit code-level contract surfaces for the new direction:
 - `genie_core::llm::LlmRequestHints` carries session id, expected output
   length, priority, short-lived cache TTL, and stable system-prompt prefix
   cache metadata to runtimes that understand the `nvext` extension.
-- `[agent]` in `geniepod.toml` selects the runtime profile:
+- `[agent]` in `geniepod.toml` selects the maintained runtime profile:
   `jetson`, `raspberry_pi`, `portable_sbc`, `laptop`, or `mac`.
 - `[optional_ai_provider]` is disabled by default. API-key, OAuth-bearer, and
   other remote/alternate providers exist only for better testing, development

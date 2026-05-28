@@ -261,8 +261,9 @@ impl Default for CoreConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
-    /// Primary deployment profile. Jetson stays the flagship default, but the
-    /// agent contract must also run on portable dev hosts and SBCs.
+    /// Primary deployment profile. Jetson stays the flagship default, while
+    /// Raspberry Pi and generic portable SBCs remain maintained headless agent
+    /// profiles.
     #[serde(default)]
     pub runtime_profile: AgentRuntimeProfile,
 
