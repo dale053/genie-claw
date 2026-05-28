@@ -18,6 +18,7 @@ Runtime load path:
 | Section | Purpose |
 | --- | --- |
 | `data_dir` | Root directory for runtime databases and profile data |
+| `[optional_ai_provider]` | Disabled-by-default API provider planning, including API-key or OAuth bearer auth mode |
 | `[core]` | `genie-core` runtime behavior |
 | `[governor]` | governor polling and day/night behavior |
 | `[governor.pressure]` | memory-pressure thresholds |
@@ -27,6 +28,37 @@ Runtime load path:
 | `[web_search]` | public web search tool behavior |
 | `[connectivity]` | coprocessor boundary enablement |
 | `[connectivity.esp32c6_uart]` | UART transport settings for ESP32-C6 |
+
+## `[optional_ai_provider]`
+
+This path is disabled by default. It records whether a remote or alternate
+OpenAI-compatible provider is eligible for future wiring without changing the
+local Jetson `genie-ai-runtime` default.
+
+| Key | Purpose |
+| --- | --- |
+| `enabled` | Turn optional provider planning on |
+| `provider` | `open_ai_compatible`, `open_ai`, `anthropic`, `gemini`, or `custom` |
+| `auth_mode` | `api_key` for provider keys or `oauth_bearer` for OAuth access tokens |
+| `base_url` | Provider endpoint, for example `https://api.openai.com/v1` |
+| `api_key_env` | Env var that stores an API key when `auth_mode = "api_key"` |
+| `oauth_token_env` | Env var that stores an OAuth access token when `auth_mode = "oauth_bearer"` |
+| `context_window_tokens` | Provider context budget, which must fit the agent budget |
+| `allow_remote_base_url` | Required opt-in for non-loopback provider URLs |
+
+OAuth bearer mode never stores the token in TOML. For an OpenAI OAuth-token
+deployment, use a secret env var and point config at it:
+
+```toml
+[optional_ai_provider]
+enabled = true
+provider = "open_ai"
+auth_mode = "oauth_bearer"
+base_url = "https://api.openai.com/v1"
+oauth_token_env = "OPENAI_OAUTH_ACCESS_TOKEN"
+context_window_tokens = 4096
+allow_remote_base_url = true
+```
 
 ## `[core]`
 

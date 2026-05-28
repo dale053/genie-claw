@@ -2,6 +2,7 @@ mod genie_ai_runtime;
 mod llama_cpp;
 mod mock;
 mod openai_compat;
+mod openai_compatible;
 mod provider;
 
 use anyhow::Result;
@@ -12,6 +13,7 @@ pub use genie_ai_runtime::GenieAiRuntimeBackend;
 pub use llama_cpp::LlamaCppBackend;
 pub use mock::MockLlmBackend;
 pub use openai_compat::{LlmTimeouts, Message, ResponseFormat};
+pub use openai_compatible::OpenAiCompatibleBackend;
 pub use provider::{OptionalProviderPlan, ProviderReadiness};
 
 #[async_trait]
@@ -172,6 +174,53 @@ impl LlmClient {
         }
     }
 
+    pub fn from_openai_compatible_url_with_bearer_token(url: &str, token: impl AsRef<str>) -> Self {
+        Self::from_openai_compatible_url_with_bearer_token_and_timeouts(
+            url,
+            token,
+            LlmTimeouts::default(),
+        )
+    }
+
+    pub fn from_openai_compatible_url_with_bearer_token_and_timeouts(
+        url: &str,
+        token: impl AsRef<str>,
+        timeouts: LlmTimeouts,
+    ) -> Self {
+        Self {
+            backend: Box::new(
+                OpenAiCompatibleBackend::from_url_with_bearer_token_and_timeouts(
+                    url, token, timeouts,
+                ),
+            ),
+        }
+    }
+
+    pub fn from_openai_compatible_url_with_bearer_token_env(
+        url: &str,
+        env_var: impl AsRef<str>,
+    ) -> Self {
+        Self::from_openai_compatible_url_with_bearer_token_env_and_timeouts(
+            url,
+            env_var,
+            LlmTimeouts::default(),
+        )
+    }
+
+    pub fn from_openai_compatible_url_with_bearer_token_env_and_timeouts(
+        url: &str,
+        env_var: impl AsRef<str>,
+        timeouts: LlmTimeouts,
+    ) -> Self {
+        Self {
+            backend: Box::new(
+                OpenAiCompatibleBackend::from_url_with_bearer_token_env_and_timeouts(
+                    url, env_var, timeouts,
+                ),
+            ),
+        }
+    }
+
     /// Construct an in-memory LLM client that replays the given scripted
     /// replies in order. Used by `tests/voice_loop_integration.rs` (issue #21).
     pub fn mock<I, S>(replies: I) -> Self
@@ -287,6 +336,15 @@ mod tests {
     fn can_construct_genie_ai_runtime_client() {
         let client = LlmClient::from_genie_ai_runtime_url("http://127.0.0.1:8080/health");
         assert_eq!(client.backend_name(), "genie-ai-runtime");
+    }
+
+    #[test]
+    fn can_construct_openai_compatible_bearer_client() {
+        let client = LlmClient::from_openai_compatible_url_with_bearer_token(
+            "http://127.0.0.1:8080/v1",
+            "oauth-token",
+        );
+        assert_eq!(client.backend_name(), "openai-compatible");
     }
 
     #[test]

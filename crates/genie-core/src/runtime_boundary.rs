@@ -93,7 +93,7 @@ pub fn is_jetson_baseline(agent: &AgentConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genie_common::config::OptionalAiProviderKind;
+    use genie_common::config::{OptionalAiProviderAuthMode, OptionalAiProviderKind};
 
     #[test]
     fn default_agent_contract_is_jetson_limited_context() {
@@ -122,8 +122,10 @@ mod tests {
         let provider = OptionalAiProviderConfig {
             enabled: true,
             provider: OptionalAiProviderKind::OpenAi,
+            auth_mode: OptionalAiProviderAuthMode::ApiKey,
             base_url: "https://api.openai.com/v1".into(),
             api_key_env: "OPENAI_API_KEY".into(),
+            oauth_token_env: "OPENAI_OAUTH_ACCESS_TOKEN".into(),
             context_window_tokens: 8192,
             allow_remote_base_url: true,
         };

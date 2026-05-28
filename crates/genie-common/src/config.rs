@@ -329,6 +329,12 @@ pub struct OptionalAiProviderConfig {
     #[serde(default)]
     pub provider: OptionalAiProviderKind,
 
+    /// Credential type used by the provider. `api_key` preserves the existing
+    /// default; `oauth_bearer` lets operators provide an OAuth access token
+    /// through `oauth_token_env` without storing the token in config.
+    #[serde(default)]
+    pub auth_mode: OptionalAiProviderAuthMode,
+
     /// Base URL or endpoint identifier for provider clients. Empty while
     /// disabled. Remote endpoints require allow_remote_base_url = true.
     #[serde(default)]
@@ -338,6 +344,12 @@ pub struct OptionalAiProviderConfig {
     /// never stored in config and is not included in support summaries.
     #[serde(default = "defaults::optional_ai_provider_api_key_env")]
     pub api_key_env: String,
+
+    /// Environment variable that contains an OAuth bearer access token when
+    /// `auth_mode = "oauth_bearer"`. The token value itself is never stored in
+    /// config and is not included in support summaries.
+    #[serde(default = "defaults::optional_ai_provider_oauth_token_env")]
+    pub oauth_token_env: String,
 
     /// Provider path must pass the same limited-context harness before it is
     /// promoted. Keep this at or below [agent].context_window_tokens.
@@ -357,8 +369,15 @@ impl OptionalAiProviderConfig {
     pub fn production_candidate(&self, agent: &AgentConfig) -> bool {
         self.enabled
             && self.limited_context_compatible(agent)
-            && !self.api_key_env.trim().is_empty()
+            && !self.credential_env().trim().is_empty()
             && (!is_remote_url(&self.base_url) || self.allow_remote_base_url)
+    }
+
+    pub fn credential_env(&self) -> &str {
+        match self.auth_mode {
+            OptionalAiProviderAuthMode::ApiKey => &self.api_key_env,
+            OptionalAiProviderAuthMode::OAuthBearer => &self.oauth_token_env,
+        }
     }
 }
 
@@ -367,12 +386,28 @@ impl Default for OptionalAiProviderConfig {
         Self {
             enabled: false,
             provider: OptionalAiProviderKind::OpenAiCompatible,
+            auth_mode: OptionalAiProviderAuthMode::ApiKey,
             base_url: String::new(),
             api_key_env: defaults::optional_ai_provider_api_key_env(),
+            oauth_token_env: defaults::optional_ai_provider_oauth_token_env(),
             context_window_tokens: defaults::agent_context_window_tokens(),
             allow_remote_base_url: false,
         }
     }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionalAiProviderAuthMode {
+    /// Standard provider key loaded from `api_key_env`.
+    #[default]
+    ApiKey,
+    /// OAuth access token loaded from `oauth_token_env` and sent as
+    /// `Authorization: Bearer <token>`.
+    #[serde(rename = "oauth_bearer")]
+    #[serde(alias = "oauth")]
+    #[serde(alias = "oauth2")]
+    OAuthBearer,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -1464,12 +1499,15 @@ impl Config {
             "optional_ai_provider": {
                 "enabled": self.optional_ai_provider.enabled,
                 "provider": format!("{:?}", self.optional_ai_provider.provider),
+                "auth_mode": format!("{:?}", self.optional_ai_provider.auth_mode),
                 "context_window_tokens": self.optional_ai_provider.context_window_tokens,
                 "limited_context_compatible": self.optional_ai_provider.limited_context_compatible(&self.agent),
                 "allow_remote_base_url": self.optional_ai_provider.allow_remote_base_url,
                 "api_key_env_configured": !self.optional_ai_provider.api_key_env.trim().is_empty(),
+                "oauth_token_env_configured": !self.optional_ai_provider.oauth_token_env.trim().is_empty(),
                 "base_url_configured": !self.optional_ai_provider.base_url.trim().is_empty(),
-                "api_key_value_exposed": false
+                "api_key_value_exposed": false,
+                "credential_value_exposed": false
             },
             "policy": {
                 "tool_policy_enabled": self.core.tool_policy.enabled,
@@ -1673,6 +1711,14 @@ home_runtime_boundary = "external_runtime"
             config.optional_ai_provider.provider,
             OptionalAiProviderKind::OpenAiCompatible
         );
+        assert_eq!(
+            config.optional_ai_provider.auth_mode,
+            OptionalAiProviderAuthMode::ApiKey
+        );
+        assert_eq!(
+            config.optional_ai_provider.credential_env(),
+            "GENIEPOD_AI_PROVIDER_API_KEY"
+        );
         assert!(
             config
                 .optional_ai_provider
@@ -1702,6 +1748,27 @@ allow_remote_base_url = true
 
         assert!(!provider.limited_context_compatible(&agent));
         assert!(!provider.production_candidate(&agent));
+    }
+
+    #[test]
+    fn optional_ai_provider_can_use_oauth_bearer_env() {
+        let agent = AgentConfig::default();
+        let provider: OptionalAiProviderConfig = toml::from_str(
+            r#"
+enabled = true
+provider = "open_ai"
+auth_mode = "oauth_bearer"
+base_url = "https://api.openai.com/v1"
+oauth_token_env = "OPENAI_OAUTH_ACCESS_TOKEN"
+context_window_tokens = 4096
+allow_remote_base_url = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(provider.auth_mode, OptionalAiProviderAuthMode::OAuthBearer);
+        assert_eq!(provider.credential_env(), "OPENAI_OAUTH_ACCESS_TOKEN");
+        assert!(provider.production_candidate(&agent));
     }
 
     #[test]
@@ -2550,6 +2617,9 @@ mod defaults {
     }
     pub fn optional_ai_provider_api_key_env() -> String {
         "GENIEPOD_AI_PROVIDER_API_KEY".into()
+    }
+    pub fn optional_ai_provider_oauth_token_env() -> String {
+        "GENIEPOD_AI_PROVIDER_OAUTH_TOKEN".into()
     }
     pub fn llm_model_name() -> String {
         "phi".into()

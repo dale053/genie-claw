@@ -60,6 +60,34 @@ pub struct OpenAiCompatClient {
     port: u16,
     request_profile: RequestProfile,
     timeouts: LlmTimeouts,
+    auth: Option<AuthorizationHeader>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AuthorizationHeader {
+    value: String,
+}
+
+impl std::fmt::Debug for AuthorizationHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthorizationHeader([redacted])")
+    }
+}
+
+impl AuthorizationHeader {
+    pub(crate) fn bearer(token: impl AsRef<str>) -> Option<Self> {
+        let token = token.as_ref().trim();
+        if token.is_empty() || token.contains(['\r', '\n']) {
+            return None;
+        }
+        Some(Self {
+            value: format!("Bearer {token}"),
+        })
+    }
+
+    fn header_line(&self) -> String {
+        format!("Authorization: {}\r\n", self.value)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -332,6 +360,7 @@ impl OpenAiCompatClient {
             port,
             request_profile,
             timeouts,
+            auth: None,
         }
     }
 
@@ -368,11 +397,32 @@ impl OpenAiCompatClient {
             port,
             request_profile,
             timeouts,
+            auth: None,
         }
     }
 
     pub fn backend_name(&self) -> &str {
         self.backend_name
+    }
+
+    pub(crate) fn with_bearer_token(mut self, token: impl AsRef<str>) -> Self {
+        self.auth = AuthorizationHeader::bearer(token);
+        self
+    }
+
+    pub(crate) fn with_bearer_token_env(mut self, env_var: impl AsRef<str>) -> Self {
+        let env_var = env_var.as_ref().trim();
+        if let Ok(token) = std::env::var(env_var) {
+            self.auth = AuthorizationHeader::bearer(token);
+        }
+        self
+    }
+
+    fn authorization_header(&self) -> String {
+        self.auth
+            .as_ref()
+            .map(AuthorizationHeader::header_line)
+            .unwrap_or_default()
     }
 
     /// Connect to the backend, bounded by the configured connect timeout.
@@ -610,9 +660,10 @@ impl OpenAiCompatClient {
         let (reader, mut writer) = stream.into_split();
 
         let http_req = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccept: text/event-stream\r\n\r\n{}",
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccept: text/event-stream\r\n{}\r\n{}",
             addr,
             prepared.body.len(),
+            self.authorization_header(),
             prepared.body,
         );
 
@@ -724,10 +775,11 @@ impl OpenAiCompatClient {
         let (reader, mut writer) = stream.into_split();
 
         let request = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
             path,
             addr,
             body.len(),
+            self.authorization_header(),
             body
         );
 
@@ -753,8 +805,10 @@ impl OpenAiCompatClient {
         let (reader, mut writer) = stream.into_split();
 
         let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            path, addr
+            "GET {} HTTP/1.1\r\nHost: {}\r\n{}Connection: close\r\n\r\n",
+            path,
+            addr,
+            self.authorization_header()
         );
         self.timed(
             self.timeouts.read,
@@ -1636,7 +1690,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_oversize_content_length() {
-        let addr = spawn_test_listener(|mut conn| async move {
+        let addr = spawn_test_listener(move |mut conn| async move {
             let mut buf = [0u8; 1024];
             let _ = conn.read(&mut buf).await;
             let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n";
@@ -1708,6 +1762,53 @@ mod tests {
         let response = read_bounded_http_response(reader, 16 * 1024).await.unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, r#"{"ok":true}"#);
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_header_is_sent_on_chat_requests() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let addr = spawn_test_listener(|mut conn| async move {
+            let mut buf = [0u8; 4096];
+            let n = conn.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = tx.send(request);
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = conn.write_all(response.as_bytes()).await;
+            let _ = conn.shutdown().await;
+        })
+        .await;
+
+        let client = OpenAiCompatClient::from_url_with_profile_and_timeouts(
+            "test-backend",
+            &format!("http://{addr}"),
+            RequestProfile::generic(),
+            LlmTimeouts {
+                connect: Duration::from_secs(2),
+                read: Duration::from_secs(2),
+                request: Duration::from_secs(2),
+            },
+        )
+        .with_bearer_token("oauth-access-token");
+
+        let response = client
+            .chat(
+                &[Message {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                Some(8),
+            )
+            .await
+            .unwrap();
+        let request = rx.await.unwrap();
+
+        assert_eq!(response, "ok");
+        assert!(request.contains("Authorization: Bearer oauth-access-token\r\n"));
     }
 
     #[test]

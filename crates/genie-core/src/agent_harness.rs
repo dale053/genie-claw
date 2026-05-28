@@ -110,7 +110,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genie_common::config::OptionalAiProviderKind;
+    use genie_common::config::{OptionalAiProviderAuthMode, OptionalAiProviderKind};
 
     fn sample_tool(name: &str) -> ToolDef {
         ToolDef {
@@ -176,8 +176,10 @@ mod tests {
         let provider = OptionalAiProviderConfig {
             enabled: true,
             provider: OptionalAiProviderKind::OpenAiCompatible,
+            auth_mode: OptionalAiProviderAuthMode::ApiKey,
             base_url: "https://provider.example/v1".into(),
             api_key_env: "GENIE_PROVIDER_KEY".into(),
+            oauth_token_env: "GENIE_PROVIDER_OAUTH_TOKEN".into(),
             context_window_tokens: 8192,
             allow_remote_base_url: true,
         };

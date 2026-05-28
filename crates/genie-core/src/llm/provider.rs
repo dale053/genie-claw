@@ -5,7 +5,9 @@
 //! wired behind the existing LLM facade without violating the limited-context
 //! agent contract.
 
-use genie_common::config::{AgentConfig, OptionalAiProviderConfig, OptionalAiProviderKind};
+use genie_common::config::{
+    AgentConfig, OptionalAiProviderAuthMode, OptionalAiProviderConfig, OptionalAiProviderKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderReadiness {
@@ -17,8 +19,10 @@ pub enum ProviderReadiness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptionalProviderPlan {
     pub provider: OptionalAiProviderKind,
+    pub auth_mode: OptionalAiProviderAuthMode,
     pub base_url: String,
     pub api_key_env: String,
+    pub oauth_token_env: String,
     pub context_window_tokens: u32,
     pub remote_allowed: bool,
 }
@@ -31,8 +35,10 @@ impl OptionalProviderPlan {
 
         Some(Self {
             provider: config.provider,
+            auth_mode: config.auth_mode,
             base_url: config.base_url.clone(),
             api_key_env: config.api_key_env.clone(),
+            oauth_token_env: config.oauth_token_env.clone(),
             context_window_tokens: config.context_window_tokens,
             remote_allowed: config.allow_remote_base_url,
         })
@@ -43,8 +49,11 @@ impl OptionalProviderPlan {
         if self.context_window_tokens > agent.context_window_tokens {
             reasons.push("context_window_exceeds_agent_budget");
         }
-        if self.api_key_env.trim().is_empty() {
-            reasons.push("missing_api_key_env");
+        if self.credential_env().trim().is_empty() {
+            reasons.push(match self.auth_mode {
+                OptionalAiProviderAuthMode::ApiKey => "missing_api_key_env",
+                OptionalAiProviderAuthMode::OAuthBearer => "missing_oauth_token_env",
+            });
         }
         if self.base_url.trim().is_empty() {
             reasons.push("missing_base_url");
@@ -57,6 +66,13 @@ impl OptionalProviderPlan {
             ProviderReadiness::Ready
         } else {
             ProviderReadiness::Blocked(reasons)
+        }
+    }
+
+    pub fn credential_env(&self) -> &str {
+        match self.auth_mode {
+            OptionalAiProviderAuthMode::ApiKey => &self.api_key_env,
+            OptionalAiProviderAuthMode::OAuthBearer => &self.oauth_token_env,
         }
     }
 }
@@ -95,8 +111,10 @@ mod tests {
         let provider = OptionalAiProviderConfig {
             enabled: true,
             provider: OptionalAiProviderKind::OpenAiCompatible,
+            auth_mode: OptionalAiProviderAuthMode::ApiKey,
             base_url: "https://provider.example/v1".into(),
             api_key_env: "GENIE_PROVIDER_KEY".into(),
+            oauth_token_env: "GENIE_PROVIDER_OAUTH_TOKEN".into(),
             context_window_tokens: 8192,
             allow_remote_base_url: false,
         };
@@ -116,13 +134,36 @@ mod tests {
         let provider = OptionalAiProviderConfig {
             enabled: true,
             provider: OptionalAiProviderKind::OpenAiCompatible,
+            auth_mode: OptionalAiProviderAuthMode::ApiKey,
             base_url: "http://127.0.0.1:11434/v1".into(),
             api_key_env: "LOCAL_PROVIDER_KEY".into(),
+            oauth_token_env: "LOCAL_PROVIDER_OAUTH_TOKEN".into(),
             context_window_tokens: 4096,
             allow_remote_base_url: false,
         };
         let plan = OptionalProviderPlan::from_config(&provider).unwrap();
 
+        assert_eq!(
+            plan.readiness(&AgentConfig::default()),
+            ProviderReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn oauth_provider_uses_oauth_token_env_for_readiness() {
+        let provider = OptionalAiProviderConfig {
+            enabled: true,
+            provider: OptionalAiProviderKind::OpenAi,
+            auth_mode: OptionalAiProviderAuthMode::OAuthBearer,
+            base_url: "https://api.openai.com/v1".into(),
+            api_key_env: String::new(),
+            oauth_token_env: "OPENAI_OAUTH_ACCESS_TOKEN".into(),
+            context_window_tokens: 4096,
+            allow_remote_base_url: true,
+        };
+        let plan = OptionalProviderPlan::from_config(&provider).unwrap();
+
+        assert_eq!(plan.credential_env(), "OPENAI_OAUTH_ACCESS_TOKEN");
         assert_eq!(
             plan.readiness(&AgentConfig::default()),
             ProviderReadiness::Ready

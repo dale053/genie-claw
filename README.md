@@ -86,9 +86,9 @@ The repo now has explicit code-level contract surfaces for the new direction:
   cache metadata to runtimes that understand the `nvext` extension.
 - `[agent]` in `geniepod.toml` selects the runtime profile:
   `jetson`, `raspberry_pi`, `portable_sbc`, `laptop`, or `mac`.
-- `[optional_ai_provider]` is disabled by default. API-key providers must keep
-  their configured context at or below `[agent].context_window_tokens` before
-  they are production candidates.
+- `[optional_ai_provider]` is disabled by default. API-key and OAuth-bearer
+  providers must keep their configured context at or below
+  `[agent].context_window_tokens` before they are production candidates.
 
 ## Quick Start
 
