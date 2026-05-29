@@ -10,6 +10,8 @@
 //!   genie-ctl tools           List available tools
 //!   genie-ctl bfcl-score --cases CASES.jsonl --predictions PREDS.jsonl [--json]
 //!                              Score tool-call accuracy from JSONL fixtures
+//!   genie-ctl bfcl-import-ha-intents --source INTENTS_DIR --out CASES.jsonl
+//!                              Convert Home Assistant Intents into BFCL cases
 //!   genie-ctl skill ...       Manage loadable skill modules
 //!   genie-ctl speaker ...     Manage local speaker identity profiles
 //!   genie-ctl health          Check service health
@@ -34,6 +36,8 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "voice")]
 use std::process::Command;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+mod bfcl_import;
 
 const GOVERNOR_SOCK: &str = "/run/geniepod/governor.sock";
 
@@ -133,6 +137,15 @@ async fn main() -> Result<()> {
             let score_args = parse_bfcl_score_args(&args[2..])?;
             cmd_bfcl_score(&score_args)?;
         }
+        "bfcl-import-ha-intents" => {
+            let import_args = bfcl_import::parse_ha_intents_import_args(&args[2..])?;
+            let report = bfcl_import::import_ha_intents(&import_args)?;
+            println!(
+                "generated {} BFCL cases from {} Home Assistant Intents sentence templates",
+                report.generated_cases, report.read_sentences
+            );
+            println!("output: {}", import_args.out.display());
+        }
         "connectivity" | "radio" => cmd_connectivity().await?,
         "skill" | "skills" => {
             if args.len() < 3 {
@@ -208,6 +221,8 @@ COMMANDS:
     tools               List available tools
     bfcl-score --cases C --predictions P [--json]
                         Score tool-call accuracy from JSONL fixtures
+    bfcl-import-ha-intents --source DIR --out CASES.jsonl [--language en] [--limit N]
+                        Convert Home Assistant Intents into attributed BFCL cases
     connectivity        Inspect ESP32-C6 Thread/Matter sidecar status
     skill <SUBCOMMAND>  Manage loadable skill modules
 {speaker}\

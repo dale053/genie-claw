@@ -70,7 +70,10 @@ not pretend to be public benchmark data.
 ## Conversion Rules
 
 1. Convert Home Assistant Intents into typed Genie tool calls, not natural
-   language answer checks.
+   language answer checks. Use `genie-ctl bfcl-import-ha-intents --source
+   tests/bfcl/local/ha-intents --out tests/bfcl/local/ha_home_cases.jsonl` so
+   generated cases include source/license metadata. Use `--language all` when
+   testing multilingual routing robustness.
 2. Convert CASAS timelines into small home-context snapshots before a prompt:
    room activity, presence, door/motion events, and current sensor state.
 3. Convert REFIT and UK-DALE into aggregate device-state facts and expected

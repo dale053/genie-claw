@@ -13,6 +13,20 @@ cargo run -p genie-ctl -- bfcl-score \
   --predictions tests/bfcl/home_tool_predictions.jsonl
 ```
 
+To generate a local Home Assistant Intents-derived suite without committing raw
+public data:
+
+```bash
+git clone --depth 1 https://github.com/OHF-Voice/intents tests/bfcl/local/ha-intents
+cargo run -p genie-ctl -- bfcl-import-ha-intents \
+  --source tests/bfcl/local/ha-intents \
+  --out tests/bfcl/local/ha_home_cases.jsonl \
+  --language en \
+  --limit 1000
+```
+
+Use `--language all` for a larger multilingual suite.
+
 The fixture format is intentionally plain:
 
 - `home_tool_cases.jsonl`: one case per line with `id`, `prompt`,
