@@ -34,8 +34,6 @@ port = 3000
 bind_host = "127.0.0.1"           # Safer default. Use "0.0.0.0" only behind a trusted gateway/firewall.
 ha_token = ""                     # Only needed when Home Assistant service is enabled below. Or set HA_TOKEN env var.
 llm_model_name = "qwen"           # For prompt optimization. Options: nemotron-4b, tinyllama, llama, qwen, phi, gemma
-                                  # alpha.9 default: Qwen3-4B Q4_K_M + genie-ai-runtime.
-llm_model_name = "qwen"           # For prompt optimization. Options: nemotron-4b, tinyllama, llama, qwen, phi
                                   # Jetson default: Qwen3-4B Q4_K_M + genie-ai-runtime.
                                   # Phi-4-mini fallback (issue #44):
                                   #   1) deploy/setup-jetson.sh --model phi-4-mini
