@@ -911,6 +911,7 @@ mod tests {
             core: CoreConfig::default(),
             agent: Default::default(),
             optional_ai_provider: Default::default(),
+            privacy_proxy: Default::default(),
             governor: GovernorConfig::default(),
             health: HealthConfig::default(),
             services: ServicesConfig::default(),

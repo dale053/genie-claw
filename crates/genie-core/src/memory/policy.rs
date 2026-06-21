@@ -280,6 +280,38 @@ pub fn assess_memory_read(
     }
 }
 
+/// Escalation policy for cloud routing via PrivacyProxy (issue #418).
+///
+/// Determines whether a memory fact may be included in a request forwarded
+/// through the on-device anonymizing proxy to a cloud model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalationPolicy {
+    /// Fact must remain on-device. Never send it even through an anonymizing proxy.
+    LocalOnly,
+    /// Fact is eligible for cloud escalation via PrivacyProxy.
+    /// PrivacyProxy applies deterministic identifier masking before forwarding.
+    Anonymized,
+}
+
+/// Determine the escalation policy for a memory fact based on its policy metadata.
+///
+/// `Private` scope and `Restricted` sensitivity facts are always `LocalOnly`:
+/// they must not travel through any proxy, even an anonymizing one, because
+/// the proxy sees the raw content before masking.
+pub fn escalation_policy(metadata: MemoryPolicyMetadata) -> EscalationPolicy {
+    match (metadata.scope, metadata.sensitivity) {
+        (MemoryScope::Private, _) | (_, MemorySensitivity::Restricted) => {
+            EscalationPolicy::LocalOnly
+        }
+        _ => EscalationPolicy::Anonymized,
+    }
+}
+
+/// Return true when a memory fact (by kind + content) is eligible for cloud escalation.
+pub fn eligible_for_escalation(kind: &str, content: &str) -> bool {
+    escalation_policy(infer_metadata(kind, content)) == EscalationPolicy::Anonymized
+}
+
 pub fn may_inject_into_shared_prompt(kind: &str, content: &str) -> bool {
     let metadata = infer_metadata(kind, content);
     assess_memory_read(metadata, MemoryReadContext::shared_room_voice()).allowed
@@ -421,6 +453,54 @@ mod tests {
             },
         );
         assert!(medium.allowed);
+    }
+
+    #[test]
+    fn household_normal_memory_is_anonymized_eligible() {
+        let metadata = infer_metadata("preference", "User likes jazz music");
+        assert_eq!(escalation_policy(metadata), EscalationPolicy::Anonymized);
+        assert!(eligible_for_escalation("preference", "User likes jazz music"));
+    }
+
+    #[test]
+    fn private_scope_memory_is_local_only() {
+        let metadata = MemoryPolicyMetadata {
+            scope: MemoryScope::Private,
+            sensitivity: MemorySensitivity::Normal,
+            spoken_policy: SpokenMemoryPolicy::AppOnly,
+        };
+        assert_eq!(escalation_policy(metadata), EscalationPolicy::LocalOnly);
+    }
+
+    #[test]
+    fn restricted_sensitivity_is_local_only_regardless_of_scope() {
+        for scope in [
+            MemoryScope::Session,
+            MemoryScope::Household,
+            MemoryScope::Person,
+            MemoryScope::Private,
+        ] {
+            let metadata = MemoryPolicyMetadata {
+                scope,
+                sensitivity: MemorySensitivity::Restricted,
+                spoken_policy: SpokenMemoryPolicy::Deny,
+            };
+            assert_eq!(
+                escalation_policy(metadata),
+                EscalationPolicy::LocalOnly,
+                "scope {scope:?} with Restricted sensitivity must be LocalOnly"
+            );
+        }
+    }
+
+    #[test]
+    fn password_content_is_not_eligible_for_escalation() {
+        assert!(!eligible_for_escalation("fact", "my password is swordfish"));
+    }
+
+    #[test]
+    fn person_linked_normal_memory_is_anonymized_eligible() {
+        assert!(eligible_for_escalation("person_preference", "Maya likes oat milk"));
     }
 
     #[test]
