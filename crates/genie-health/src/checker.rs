@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use genie_common::config::Config;
+use genie_common::probe::{ProbeTimeouts, probe_configured_url};
 use rusqlite::Connection;
 use tokio::net::TcpStream;
 use tokio::signal::unix::{SignalKind, signal};
@@ -32,6 +33,14 @@ fn collect_endpoints(config: &Config) -> Vec<(String, String)> {
         ("core".into(), config.core_health_url()),
         ("llm".into(), config.services.llm.url.clone()),
     ];
+
+    match config.api_status_url() {
+        Ok(url) => endpoints.push(("api".into(), url)),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "skipping genie-api health probe; check [services.api].url"
+        ),
+    }
 
     if let Some(ref ha) = config.services.homeassistant {
         endpoints.push(("homeassistant".into(), ha.url.clone()));
@@ -200,56 +209,12 @@ fn prune_health_log(db: &Connection, cutoff_ts_ms: u64) {
 
 async fn check_http(name: &str, url: &str) -> ServiceStatus {
     let start = std::time::Instant::now();
+    let timeouts = ProbeTimeouts {
+        connect: Duration::from_secs(5),
+        read: Duration::from_secs(5),
+    };
 
-    // Parse host:port from URL for TCP connect.
-    let result = async {
-        let url_parsed = url.strip_prefix("http://").unwrap_or(url);
-        let (host_port, _path) = url_parsed.split_once('/').unwrap_or((url_parsed, ""));
-
-        let stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(host_port))
-            .await
-            .map_err(|_| anyhow::anyhow!("timeout"))??;
-
-        // Send a minimal HTTP GET.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let path = url_parsed
-            .find('/')
-            .map(|i| &url_parsed[i..])
-            .unwrap_or("/");
-
-        let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            path, host_port
-        );
-
-        let mut stream = stream;
-        stream.write_all(request.as_bytes()).await?;
-
-        let mut buf = [0u8; 256];
-        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-            .await
-            .map_err(|_| anyhow::anyhow!("read timeout"))??;
-
-        let response = String::from_utf8_lossy(&buf[..n]);
-        if response.starts_with("HTTP/1.") {
-            // Extract status code.
-            let status_code: u16 = response
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            if (200..400).contains(&status_code) {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("HTTP {}", status_code))
-            }
-        } else {
-            // Non-HTTP but something responded — treat as alive.
-            Ok(())
-        }
-    }
-    .await;
-
+    let result = probe_configured_url(url, timeouts).await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     match result {
@@ -279,7 +244,7 @@ async fn send_http_post(url: &str, body: &str) -> Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("timeout"))??;
 
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         path,
@@ -290,7 +255,27 @@ async fn send_http_post(url: &str, body: &str) -> Result<()> {
 
     let mut stream = stream;
     stream.write_all(request.as_bytes()).await?;
-    Ok(())
+
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .map_err(|_| anyhow::anyhow!("read timeout"))??;
+
+    let response = String::from_utf8_lossy(&buf[..n]);
+    if response.starts_with("HTTP/1.") {
+        let status_code: u16 = response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if (200..400).contains(&status_code) {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("HTTP {}", status_code))
+        }
+    } else {
+        Err(anyhow::anyhow!("invalid HTTP response"))
+    }
 }
 
 fn now_ms() -> u64 {
@@ -341,6 +326,7 @@ mod tests {
             telegram: TelegramConfig::default(),
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
+            http: Default::default(),
         }
     }
 
@@ -351,6 +337,7 @@ mod tests {
 
         assert!(names.contains(&"core"));
         assert!(names.contains(&"llm"));
+        assert!(names.contains(&"api"));
         assert!(!names.contains(&"homeassistant"));
     }
 
@@ -383,6 +370,33 @@ mod tests {
             .expect("llm endpoint should always be present");
 
         assert_eq!(llm_url, "http://127.0.0.1:9999/v1/health");
+    }
+
+    #[test]
+    fn api_endpoint_url_uses_derived_status_url() {
+        let mut config = test_config();
+        config.services.api.url = "127.0.0.1:4080/api/status".into();
+
+        let endpoints = collect_endpoints(&config);
+        let api_url = endpoints
+            .iter()
+            .find(|(name, _)| name == "api")
+            .map(|(_, url)| url.as_str())
+            .expect("api endpoint should always be present when api_status_url parses");
+
+        assert_eq!(api_url, "http://127.0.0.1:4080/api/status");
+    }
+
+    #[test]
+    fn api_endpoint_omitted_when_status_url_unsupported() {
+        let mut config = test_config();
+        config.services.api.url = "https://api.example/api/status".into();
+
+        let endpoints = collect_endpoints(&config);
+        assert!(
+            !endpoints.iter().any(|(name, _)| name == "api"),
+            "https api url cannot be probed by plain HTTP client"
+        );
     }
 
     fn open_test_db(dir: &std::path::Path) -> Connection {
@@ -474,5 +488,82 @@ mod tests {
         perms.set_mode(0o644);
         std::fs::set_permissions(&db_path, perms).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn send_http_post_rejects_non_http_tcp_banner() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/api/alert");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(b"SSH-2.0-OpenSSH_9.0\r\n").await;
+            }
+        });
+
+        let error = send_http_post(&url, r#"{"message":"test"}"#)
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(
+            error.to_string().contains("invalid HTTP response"),
+            "expected invalid HTTP error, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_http_post_accepts_valid_http_status_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/api/alert");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        send_http_post(&url, r#"{"message":"test"}"#)
+            .await
+            .expect("alert webhook POST should succeed on HTTP 204");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_http_post_rejects_http_500_status_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/api/alert");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let error = send_http_post(&url, r#"{"message":"test"}"#)
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(
+            error.to_string().contains("HTTP 500"),
+            "expected HTTP 500 error, got: {error}"
+        );
     }
 }

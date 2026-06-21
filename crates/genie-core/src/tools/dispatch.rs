@@ -4,15 +4,13 @@ use genie_common::config::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::actuation::{
-    ActionLedger, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager, PendingConfirmation,
-    RecordedAction, RequestOrigin, now_ms,
+    ActionLedger, AuditError, AuditEvent, AuditLogger, AuditStatus, ConfirmationManager,
+    PendingConfirmation, RecordedAction, RequestOrigin, append_json_line, now_ms,
 };
 use super::home;
 use super::timer;
@@ -21,10 +19,236 @@ use crate::skills::SkillLoader;
 
 const ACTUATION_RATE_WINDOW_MS: u64 = 60_000;
 
+const HOME_CONTROL_ACTIONS: &[&str] = &[
+    "turn_on",
+    "turn_off",
+    "toggle",
+    "set_brightness",
+    "set_temperature",
+    "open",
+    "close",
+    "lock",
+    "unlock",
+    "activate",
+];
+
+fn parse_home_control_args(args: &serde_json::Value) -> Result<(&str, &str, Option<f64>)> {
+    let entity = args
+        .get("entity")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("home_control requires non-empty string argument 'entity'")
+        })?;
+    let raw_action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("home_control requires string argument 'action'"))?;
+    let action = canon_home_control_action(raw_action).ok_or_else(|| {
+        anyhow::anyhow!(
+            "home_control action '{}' is invalid; expected one of: {}",
+            raw_action,
+            HOME_CONTROL_ACTIONS.join(", ")
+        )
+    })?;
+    // `value` stays optional, but a *provided* value must be a number. The old
+    // `args.get("value").and_then(|v| v.as_f64())` silently dropped a non-numeric
+    // value (e.g. a model emitting `"value": "72"` or `"value": true`) to `None`,
+    // so `set_temperature` / `set_brightness` actuated with no value instead of
+    // the user's intent. Reject the malformed value at the boundary the same way
+    // set_timer rejects a non-integer `seconds`; an absent or null value is still
+    // a no-op None.
+    let value = match args.get("value") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(provided) => Some(provided.as_f64().ok_or_else(|| {
+            anyhow::anyhow!("home_control 'value' must be a number when provided")
+        })?),
+    };
+    // set_brightness / set_temperature actuate a numeric setpoint, so a call with
+    // no `value` is under-specified. The provider used to substitute a hardcoded
+    // default (brightness 50 / temperature 20) and report success, actuating a
+    // setpoint the user never asked for. Reject the missing value at the boundary
+    // so the agent asks for the number instead of guessing — the same boundary
+    // #414 uses to reject a *non-numeric* value. (issue #421)
+    if value.is_none() && action_requires_value(action) {
+        anyhow::bail!("home_control '{action}' requires a numeric argument 'value'");
+    }
+    Ok((entity, action, value))
+}
+
+/// Actions that actuate a numeric setpoint and therefore require a `value`.
+/// Every other action (turn_on, turn_off, toggle, open, close, lock, unlock,
+/// activate) is a no-op for `value` and leaves it `None`.
+fn action_requires_value(action: &str) -> bool {
+    matches!(action, "set_brightness" | "set_temperature")
+}
+
+/// Canonicalize a model-emitted action verb to one of [`HOME_CONTROL_ACTIONS`].
+///
+/// Small models routinely emit the natural-language form ("turn off"),
+/// hyphenated/cased variants ("Turn-Off"), or a synonym ("deactivate") rather
+/// than the exact enum value `turn_off`. Rejecting those means a correct intent
+/// silently fails to actuate. Normalize separators + case, map a few
+/// unambiguous synonyms, and accept the result only if it lands on a real
+/// action. `activate` is left as-is (it is its own action for scenes/scripts).
+fn canon_home_control_action(raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_lowercase().replace([' ', '-'], "_");
+    let mapped: &str = match normalized.as_str() {
+        "deactivate" | "disable" | "switch_off" | "power_off" | "shut_off" => "turn_off",
+        "enable" | "switch_on" | "power_on" => "turn_on",
+        other => other,
+    };
+    HOME_CONTROL_ACTIONS.iter().copied().find(|&a| a == mapped)
+}
+
+fn parse_home_status_args(args: &serde_json::Value) -> Result<&str> {
+    args.get("entity")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("home_status requires non-empty string argument 'entity'"))
+}
+
+fn parse_set_timer_args(args: &serde_json::Value) -> Result<(u64, &str)> {
+    let seconds = match args.get("seconds") {
+        Some(value) => value
+            .as_u64()
+            .filter(|seconds| *seconds >= 1)
+            .ok_or_else(|| {
+                if value.as_u64() == Some(0) {
+                    anyhow::anyhow!("set_timer seconds must be at least 1")
+                } else {
+                    anyhow::anyhow!("set_timer requires integer argument 'seconds'")
+                }
+            })?,
+        None => anyhow::bail!("set_timer requires integer argument 'seconds'"),
+    };
+    let label = args
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("timer");
+    Ok((seconds, label))
+}
+
+fn parse_memory_recall_query(args: &serde_json::Value) -> Result<String> {
+    let raw = args
+        .get("query")
+        .or_else(|| args.get("topic"))
+        .or_else(|| args.get("what"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("memory_recall requires non-empty string argument 'query'")
+        })?;
+    Ok(normalize_memory_recall_query(raw))
+}
+
+fn normalize_memory_recall_query(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    if lower.contains("my name") || lower == "name" || lower.contains("who am i") {
+        "name".into()
+    } else if lower.contains("about me") || lower == "me" || lower == "user" {
+        "user".into()
+    } else {
+        raw.to_string()
+    }
+}
+
+fn parse_memory_forget_query(args: &serde_json::Value) -> Result<&str> {
+    args.get("query")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("memory_forget requires non-empty string argument 'query'"))
+}
+
+/// Reject a `memory_store` call with no usable `content` (#416). Delegates to
+/// `normalize_memories_to_store` so all valid shapes (aliases, catch-all, `name`)
+/// still pass; only missing/empty/wrong-type content is rejected.
+fn parse_memory_store_content(args: &serde_json::Value) -> Result<Vec<(String, String)>> {
+    let memories = normalize_memories_to_store(args);
+    if memories.is_empty() {
+        anyhow::bail!("memory_store requires non-empty string argument 'content'");
+    }
+    Ok(memories)
+}
+
+fn parse_calculate_expression(args: &serde_json::Value) -> Result<&str> {
+    args.get("expression")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("calculate requires non-empty string argument 'expression'"))
+}
+
+fn parse_play_media_query(args: &serde_json::Value) -> Result<&str> {
+    args.get("query")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("play_media requires non-empty string argument 'query'"))
+}
+
+fn parse_web_search_query(args: &serde_json::Value) -> Result<&str> {
+    args.get("query")
+        .or_else(|| args.get("q"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("web_search requires non-empty string argument 'query'"))
+}
+
+/// `limit` stays optional — an absent or null value defaults to 3 results. But a
+/// *provided* value must be a non-negative integer. The old
+/// `args.get("limit").and_then(|v| v.as_u64()).unwrap_or(3)` silently coerced a
+/// malformed limit (a stringified `"5"`, a float `2.5`, or a negative) to the
+/// default 3, quietly returning a different result count than the caller asked
+/// for. Reject the malformed value at the boundary the same way home_control
+/// rejects a non-numeric `value` (PR #414); a valid integer outside 1..=5 still
+/// clamps into range rather than erroring.
+fn parse_web_search_limit(args: &serde_json::Value) -> Result<usize> {
+    match args.get("limit") {
+        None | Some(serde_json::Value::Null) => Ok(3),
+        Some(provided) => {
+            let limit = provided.as_u64().ok_or_else(|| {
+                anyhow::anyhow!("web_search 'limit' must be an integer when provided")
+            })?;
+            Ok(limit.clamp(1, 5) as usize)
+        }
+    }
+}
+
+fn parse_get_weather_location(args: &serde_json::Value) -> Result<&str> {
+    args.get("location")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("get_weather requires non-empty string argument 'location'"))
+}
+
+/// `forecast` stays optional — an absent or null value means current weather
+/// (the no-op default). But a *provided* value must be a real boolean. The old
+/// `args.get("forecast").and_then(|v| v.as_bool()).unwrap_or(false)` silently
+/// coerced a stringified `"true"` (a form small models routinely emit) to
+/// `false`, returning current weather when the user asked for the 7-day
+/// forecast. Reject the malformed value at the boundary the same way
+/// home_control rejects a non-numeric `value` (PR #414).
+fn parse_get_weather_forecast(args: &serde_json::Value) -> Result<bool> {
+    match args.get("forecast") {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(anyhow::anyhow!(
+            "get_weather 'forecast' must be a boolean when provided"
+        )),
+    }
+}
+
 /// Tool definition for LLM function calling.
 ///
-/// These are sent to llama.cpp as part of the system prompt or
-/// via the `tools` parameter (OpenAI function-calling format).
+/// These are sent to the configured LLM backend as part of the system prompt or
+/// via the `tools` parameter when a backend supports OpenAI function-calling.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolDef {
     pub name: String,
@@ -36,8 +260,39 @@ pub struct ToolDef {
 #[derive(Debug, Serialize)]
 pub struct ToolResult {
     pub tool: String,
+    pub action_class: ToolActionClass,
     pub success: bool,
     pub output: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolActionClass {
+    ReadOnly,
+    Diagnostic,
+    MemoryRead,
+    MemoryWrite,
+    HomeActuation,
+    Media,
+    Network,
+    Timer,
+    Skill,
+}
+
+impl ToolActionClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Diagnostic => "diagnostic",
+            Self::MemoryRead => "memory_read",
+            Self::MemoryWrite => "memory_write",
+            Self::HomeActuation => "home_actuation",
+            Self::Media => "media",
+            Self::Network => "network",
+            Self::Timer => "timer",
+            Self::Skill => "skill",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -49,7 +304,7 @@ pub struct ToolExecutionContext {
 
 /// LLM-generated tool call (parsed from model output).
 /// Accepts both `{"tool": "..."}` and `{"name": "..."}` formats.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     #[serde(alias = "tool")]
     pub name: String,
@@ -68,6 +323,8 @@ pub struct ToolDispatcher {
     confirmations: Arc<ConfirmationManager>,
     action_ledger: Arc<ActionLedger>,
     actuation_rate_limiter: Arc<ActuationRateLimiter>,
+    tool_rate_limiter: Arc<ToolRateLimiter>,
+    tool_confirmations: Arc<ToolConfirmationGate>,
     audit_logger: AuditLogger,
     tool_audit_logger: ToolAuditLogger,
     pub(crate) timers: timer::TimerManager,
@@ -78,12 +335,84 @@ struct ActuationRateLimiter {
     attempts: Mutex<HashMap<RequestOrigin, VecDeque<u64>>>,
 }
 
+/// Per-tool sliding-window rate limiter for the dispatcher gate. Unlike
+/// [`ActuationRateLimiter`] (which buckets physical home actions by origin),
+/// this bounds *any* tool by name via `tool_policy.max_actions_per_minute_by_tool`
+/// so a fast loop (voice, skill, or LLM) bounces off the limit after N calls.
+#[derive(Debug, Default)]
+struct ToolRateLimiter {
+    attempts: Mutex<HashMap<String, VecDeque<u64>>>,
+}
+
+/// Two-step confirmation gate for sensitive tools (issue #22).
+///
+/// A tool listed in `tool_policy.requires_confirmation_tools` must be requested
+/// twice with the same `(origin, tool, arguments)` within a TTL window: the
+/// first leg (`confirmed = false`) records the request and returns a stable
+/// token asking the caller to repeat it; the confirming leg (`confirmed = true`)
+/// only executes when a matching first leg is still inside the window, otherwise
+/// it reports the confirmation as expired.
+#[derive(Debug, Default)]
+struct ToolConfirmationGate {
+    /// Map of `(origin, tool, args)` key -> first-seen epoch millis.
+    pending: Mutex<HashMap<String, u64>>,
+}
+
+/// Pending first legs are retained for an hour so a late confirming leg reports
+/// "expired" rather than silently restarting confirmation, while still bounding
+/// memory if a first leg is never followed up.
+const TOOL_CONFIRMATION_RETENTION_MS: u64 = 60 * 60 * 1000;
+
+/// Hard cap on tracked first legs; the oldest is evicted past this so a flood of
+/// distinct sensitive requests cannot grow the map without bound.
+const MAX_TOOL_CONFIRMATIONS: usize = 256;
+
+enum ToolConfirmDecision {
+    /// First leg recorded; caller must repeat the same request to proceed.
+    Pending { token: String },
+    /// A matching first leg is still inside the TTL window — proceed.
+    Confirmed,
+    /// The confirming leg arrived with no live first leg (never requested, or
+    /// the TTL window elapsed).
+    Expired,
+}
+
+/// How the gate resolved a tool call, recorded on every tool-audit line so the
+/// evidence trail distinguishes an execution from each refusal class.
+#[derive(Debug, Clone, Copy)]
+enum GateDecision {
+    Executed,
+    Error,
+    DeniedPolicy,
+    RateLimited,
+    PendingConfirmation,
+    ConfirmationExpired,
+}
+
+impl GateDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Executed => "executed",
+            Self::Error => "error",
+            Self::DeniedPolicy => "denied_policy",
+            Self::RateLimited => "rate_limited",
+            Self::PendingConfirmation => "pending_confirmation",
+            Self::ConfirmationExpired => "confirmation_expired",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ToolAuditEvent {
     ts_ms: u64,
     tool: String,
+    action_class: ToolActionClass,
     origin: RequestOrigin,
     success: bool,
+    /// Which gate branch produced this line: `executed`, `error`,
+    /// `denied_policy`, `rate_limited`, `pending_confirmation`, or
+    /// `confirmation_expired`.
+    decision: &'static str,
     duration_ms: u64,
     argument_keys: Vec<String>,
     output_chars: usize,
@@ -103,21 +432,22 @@ impl ToolAuditLogger {
         }
     }
 
-    fn append(&self, event: ToolAuditEvent) {
+    fn append(&self, event: ToolAuditEvent) -> Result<(), AuditError> {
         let Some(path) = &self.path else {
-            return;
+            return Ok(());
         };
         let _guard = self.lock.lock().expect("tool audit logger lock");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        append_json_line(path, &event)
+    }
+
+    fn append_or_log(&self, event: ToolAuditEvent) {
+        if let Err(err) = self.append(event) {
+            tracing::error!(
+                path = ?self.path,
+                error = %err,
+                "tool audit event dropped due to IO failure"
+            );
         }
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-            return;
-        };
-        let Ok(line) = serde_json::to_string(&event) else {
-            return;
-        };
-        let _ = writeln!(file, "{line}");
     }
 
     fn path(&self) -> Option<&std::path::Path> {
@@ -137,6 +467,8 @@ impl ToolDispatcher {
             confirmations: Arc::new(ConfirmationManager::default()),
             action_ledger: Arc::new(ActionLedger::default()),
             actuation_rate_limiter: Arc::new(ActuationRateLimiter::default()),
+            tool_rate_limiter: Arc::new(ToolRateLimiter::default()),
+            tool_confirmations: Arc::new(ToolConfirmationGate::default()),
             audit_logger: AuditLogger::disabled(),
             tool_audit_logger: ToolAuditLogger::default(),
             timers: timer::TimerManager::new(),
@@ -207,6 +539,9 @@ impl ToolDispatcher {
                 "enabled": self.tool_policy.enabled,
                 "allowed_tools_by_origin": &self.tool_policy.allowed_tools_by_origin,
                 "denied_tools_by_origin": &self.tool_policy.denied_tools_by_origin,
+                "max_actions_per_minute_by_tool": &self.tool_policy.max_actions_per_minute_by_tool,
+                "requires_confirmation_tools": &self.tool_policy.requires_confirmation_tools,
+                "confirmation_ttl_secs": self.tool_policy.confirmation_ttl_secs,
             },
             "actuation_safety": {
                 "enabled": self.actuation_safety.enabled,
@@ -465,7 +800,7 @@ impl ToolDispatcher {
 
         defs.push(ToolDef {
             name: "memory_store".into(),
-            description: "Explicitly store a safe household fact or preference. Use when the user says 'remember that...' or asks you to save something. Do not store passwords, one-time codes, payment details, keys, tokens, or private secrets.".into(),
+            description: "Explicitly store a safe household fact or preference. Use when the user says 'remember that...' or asks you to save something. Do not store passwords, one-time codes, payment details, keys, tokens, household access codes, lock combinations, sensitive document/key locations, or private secrets.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -495,16 +830,13 @@ impl ToolDispatcher {
         exec_ctx: ToolExecutionContext,
     ) -> ToolResult {
         let started = Instant::now();
-        if let Err(err) =
-            tool_origin_allowed(&self.tool_policy, exec_ctx.request_origin, &call.name)
-        {
-            let tool_result = ToolResult {
-                tool: call.name.clone(),
-                success: false,
-                output: format!("Tool blocked by origin policy: {err}"),
-            };
-            self.audit_tool_call(call, exec_ctx, started, &tool_result);
-            return tool_result;
+        let action_class = tool_action_class(&call.name);
+
+        // Single chokepoint: every tool call passes the gate (per-origin ACLs,
+        // two-step confirmation for sensitive tools, per-tool rate limits)
+        // before any tool body runs. Refusals are already audited.
+        if let Some(rejected) = self.run_gate(call, exec_ctx, started) {
+            return rejected;
         }
 
         let result = match call.name.as_str() {
@@ -521,41 +853,192 @@ impl ToolDispatcher {
             "play_media" => self.exec_play_media(&call.arguments).await,
             "memory_recall" => self.exec_memory_recall(&call.arguments, exec_ctx),
             "memory_status" => self.exec_memory_status(),
-            "memory_forget" => self.exec_memory_forget(&call.arguments),
+            "memory_forget" => self.exec_memory_forget(&call.arguments, exec_ctx),
             "memory_store" => self.exec_memory_store(&call.arguments),
-            other => self.exec_skill(other, &call.arguments),
+            other => self.exec_skill(other, &call.arguments).await,
         };
 
         let tool_result = match result {
             Ok(output) => ToolResult {
                 tool: call.name.clone(),
+                action_class,
                 success: true,
                 output,
             },
             Err(e) => ToolResult {
                 tool: call.name.clone(),
+                action_class,
                 success: false,
                 output: e.to_string(),
             },
         };
 
-        self.audit_tool_call(call, exec_ctx, started, &tool_result);
+        let decision = if tool_result.success {
+            GateDecision::Executed
+        } else {
+            GateDecision::Error
+        };
+        self.audit_gate_decision(call, exec_ctx, started, &tool_result, decision);
 
         tool_result
     }
 
-    fn audit_tool_call(
+    /// Run the tool-call gate without dispatching: per-origin ACLs, two-step
+    /// confirmation for sensitive tools, then per-tool rate limits. Returns
+    /// `Some(rejection)` (already written to the tool-audit trail) when the gate
+    /// refuses, or `None` when the call may proceed. The caller audits the
+    /// eventual outcome of an allowed call.
+    fn run_gate(
+        &self,
+        call: &ToolCall,
+        exec_ctx: ToolExecutionContext,
+        started: Instant,
+    ) -> Option<ToolResult> {
+        let action_class = tool_action_class(&call.name);
+
+        // 1. Per-origin allow/deny ACLs (wildcards supported; deny wins).
+        if let Err(err) =
+            tool_origin_allowed(&self.tool_policy, exec_ctx.request_origin, &call.name)
+        {
+            let result = ToolResult {
+                tool: call.name.clone(),
+                action_class,
+                success: false,
+                output: format!("Tool blocked by origin policy: {err}"),
+            };
+            self.audit_gate_decision(call, exec_ctx, started, &result, GateDecision::DeniedPolicy);
+            return Some(result);
+        }
+
+        // 2. Two-step confirmation for configured sensitive tools. Skipped for
+        //    pre-confirmed re-entries of tools NOT in the list (e.g. the home
+        //    actuation confirm flow, which carries its own confirmation deeper).
+        if tool_requires_confirmation(&self.tool_policy, &call.name) {
+            let ttl_ms = self.tool_policy.confirmation_ttl_secs.saturating_mul(1000);
+            match self.tool_confirmations.evaluate(
+                exec_ctx.request_origin,
+                &call.name,
+                &call.arguments,
+                ttl_ms,
+                exec_ctx.confirmed,
+            ) {
+                ToolConfirmDecision::Pending { token } => {
+                    let result = ToolResult {
+                        tool: call.name.clone(),
+                        action_class,
+                        success: true,
+                        output: format!(
+                            "Confirmation required before I run '{}'. Re-issue the same request within {}s to proceed (confirmation token {}).",
+                            call.name, self.tool_policy.confirmation_ttl_secs, token
+                        ),
+                    };
+                    self.audit_gate_decision(
+                        call,
+                        exec_ctx,
+                        started,
+                        &result,
+                        GateDecision::PendingConfirmation,
+                    );
+                    return Some(result);
+                }
+                ToolConfirmDecision::Expired => {
+                    let result = ToolResult {
+                        tool: call.name.clone(),
+                        action_class,
+                        success: false,
+                        output: format!(
+                            "Confirmation for '{}' expired or was never requested; the {}s window elapsed. Request it again to restart confirmation.",
+                            call.name, self.tool_policy.confirmation_ttl_secs
+                        ),
+                    };
+                    self.audit_gate_decision(
+                        call,
+                        exec_ctx,
+                        started,
+                        &result,
+                        GateDecision::ConfirmationExpired,
+                    );
+                    return Some(result);
+                }
+                ToolConfirmDecision::Confirmed => {}
+            }
+        }
+
+        // 3. Per-tool sliding-window rate limit. Pre-confirmed re-entries skip
+        //    the recharge: the slot was already paid by the first leg.
+        if !exec_ctx.confirmed
+            && let Err(err) = self
+                .tool_rate_limiter
+                .check_and_record(&self.tool_policy, &call.name)
+        {
+            let result = ToolResult {
+                tool: call.name.clone(),
+                action_class,
+                success: false,
+                output: format!("Tool blocked by rate limit: {err}"),
+            };
+            self.audit_gate_decision(call, exec_ctx, started, &result, GateDecision::RateLimited);
+            return Some(result);
+        }
+
+        None
+    }
+
+    /// Public chokepoint entry for specialized fast-paths (e.g. the voice
+    /// `web_search` renderer) that need the gate's ACL / confirmation /
+    /// rate-limit decision and audit trail but render their own output.
+    ///
+    /// Returns `Some(rejection)` (already audited) when the gate refuses, or
+    /// `None` when the call may proceed — in which case the caller MUST record
+    /// the eventual outcome with [`ToolDispatcher::audit_gated_tool`] so the
+    /// single chokepoint still produces exactly one audit line per call.
+    pub fn gate_tool_call(
+        &self,
+        call: &ToolCall,
+        exec_ctx: ToolExecutionContext,
+    ) -> Option<ToolResult> {
+        self.run_gate(call, exec_ctx, Instant::now())
+    }
+
+    /// Record one tool-audit line for a call that passed [`gate_tool_call`] and
+    /// was executed by a specialized fast-path.
+    pub fn audit_gated_tool(
+        &self,
+        call: &ToolCall,
+        exec_ctx: ToolExecutionContext,
+        started: Instant,
+        success: bool,
+        output: &str,
+    ) {
+        let result = ToolResult {
+            tool: call.name.clone(),
+            action_class: tool_action_class(&call.name),
+            success,
+            output: output.to_string(),
+        };
+        let decision = if success {
+            GateDecision::Executed
+        } else {
+            GateDecision::Error
+        };
+        self.audit_gate_decision(call, exec_ctx, started, &result, decision);
+    }
+
+    fn audit_gate_decision(
         &self,
         call: &ToolCall,
         exec_ctx: ToolExecutionContext,
         started: Instant,
         result: &ToolResult,
+        decision: GateDecision,
     ) {
-        self.tool_audit_logger.append(ToolAuditEvent {
+        self.tool_audit_logger.append_or_log(ToolAuditEvent {
             ts_ms: now_ms(),
             tool: call.name.clone(),
+            action_class: result.action_class,
             origin: exec_ctx.request_origin,
             success: result.success,
+            decision: decision.as_str(),
             duration_ms: started.elapsed().as_millis() as u64,
             argument_keys: tool_argument_keys(&call.arguments),
             output_chars: result.output.chars().count(),
@@ -580,22 +1063,18 @@ impl ToolDispatcher {
             .ha
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
-        let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("toggle");
-        let value = args.get("value").and_then(|v| v.as_f64());
+        let (entity_name, action, value) = parse_home_control_args(args)?;
+        let resolved_entity = self.resolve_device_alias(entity_name);
         if !actuation_origin_allowed(&self.actuation_safety, exec_ctx.request_origin) {
             let reason = format!(
                 "actuation from '{}' is not allowed by channel policy",
                 exec_ctx.request_origin.as_policy_key()
             );
-            self.audit_logger.append(AuditEvent {
+            self.audit_logger.append_or_log(AuditEvent {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedPolicy,
                 origin: exec_ctx.request_origin,
-                entity: entity_name.to_string(),
+                entity: resolved_entity.clone(),
                 action: action.to_string(),
                 value,
                 reason: reason.clone(),
@@ -616,11 +1095,11 @@ impl ToolDispatcher {
                 .check_and_record(&self.actuation_safety, exec_ctx.request_origin)
         {
             let reason = err.to_string();
-            self.audit_logger.append(AuditEvent {
+            self.audit_logger.append_or_log(AuditEvent {
                 ts_ms: now_ms(),
                 status: AuditStatus::BlockedRuntime,
                 origin: exec_ctx.request_origin,
-                entity: entity_name.to_string(),
+                entity: resolved_entity.clone(),
                 action: action.to_string(),
                 value,
                 reason: reason.clone(),
@@ -633,7 +1112,7 @@ impl ToolDispatcher {
         }
         match home::control(
             ha.as_ref(),
-            entity_name,
+            &resolved_entity,
             action,
             value,
             &self.actuation_safety,
@@ -646,7 +1125,7 @@ impl ToolDispatcher {
                 let recorded = if let Some(original_id) = undo_of {
                     self.action_ledger.record_undo(
                         original_id,
-                        entity_name,
+                        &resolved_entity,
                         action,
                         value,
                         exec_ctx.request_origin,
@@ -655,7 +1134,7 @@ impl ToolDispatcher {
                     )
                 } else {
                     self.action_ledger.record(
-                        entity_name,
+                        &resolved_entity,
                         action,
                         value,
                         exec_ctx.request_origin,
@@ -663,11 +1142,11 @@ impl ToolDispatcher {
                         confidence,
                     )
                 };
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status: AuditStatus::Executed,
                     origin: exec_ctx.request_origin,
-                    entity: entity_name.to_string(),
+                    entity: resolved_entity.clone(),
                     action: action.to_string(),
                     value,
                     reason: "home action executed".into(),
@@ -679,18 +1158,22 @@ impl ToolDispatcher {
                 Ok(output)
             }
             Ok(home::ControlOutcome::ConfirmationRequired { reason, .. }) => {
-                let pending = self.confirmations.issue(
-                    entity_name,
+                let Some(pending) = self.confirmations.issue(
+                    &resolved_entity,
                     action,
                     value,
                     &reason,
                     exec_ctx.request_origin,
-                );
-                self.audit_logger.append(AuditEvent {
+                ) else {
+                    return Ok(
+                        "Too many pending home confirmations; confirm or wait for existing ones to expire before requesting another.".into(),
+                    );
+                };
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status: AuditStatus::ConfirmationIssued,
                     origin: exec_ctx.request_origin,
-                    entity: entity_name.to_string(),
+                    entity: resolved_entity.clone(),
                     action: action.to_string(),
                     value,
                     reason: reason.clone(),
@@ -699,9 +1182,15 @@ impl ToolDispatcher {
                     action_id: None,
                     undo_of: None,
                 });
+                // The token is a bearer secret: a leaked one is a reusable
+                // door-unlock credential for its full validity window. Keep it
+                // out of LLM tool output (transcripts, voice, logs). The
+                // dashboard fetches it over /api/actuation/pending to drive the
+                // Confirm button; humans confirm there rather than reading the
+                // token back from this string.
                 Ok(format!(
-                    "Confirmation required before I can do that: {}. Pending token: {}. Confirm from the local dashboard or POST /api/actuation/confirm.",
-                    reason, pending.token
+                    "Confirmation required before I can do that: {}. Confirm this pending action from the local dashboard (or POST /api/actuation/confirm with its token from /api/actuation/pending).",
+                    reason
                 ))
             }
             Err(err) => {
@@ -713,11 +1202,11 @@ impl ToolDispatcher {
                 } else {
                     AuditStatus::Failed
                 };
-                self.audit_logger.append(AuditEvent {
+                self.audit_logger.append_or_log(AuditEvent {
                     ts_ms: now_ms(),
                     status,
                     origin: exec_ctx.request_origin,
-                    entity: entity_name.to_string(),
+                    entity: resolved_entity,
                     action: action.to_string(),
                     value,
                     reason: error.clone(),
@@ -833,18 +1322,32 @@ impl ToolDispatcher {
             .ha
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Home Assistant not connected"))?;
-        let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+        let entity_name = parse_home_status_args(args)?;
+        let entity_name = self.resolve_device_alias(entity_name);
 
-        home::status(ha.as_ref(), entity_name).await
+        home::status(ha.as_ref(), &entity_name).await
+    }
+
+    fn resolve_device_alias(&self, query: &str) -> String {
+        let Some(memory) = &self.memory else {
+            return query.to_string();
+        };
+        let Ok(memory) = memory.lock() else {
+            return query.to_string();
+        };
+        memory
+            .device_alias(query)
+            .ok()
+            .flatten()
+            .map(|alias| alias.target_id)
+            .unwrap_or_else(|| query.to_string())
     }
 
     fn exec_set_timer(&self, args: &serde_json::Value) -> Result<String> {
-        let seconds = args.get("seconds").and_then(|v| v.as_u64()).unwrap_or(60);
-        let label = args
-            .get("label")
-            .and_then(|v| v.as_str())
-            .unwrap_or("timer");
-        self.timers.set(seconds, label);
+        let (seconds, label) = parse_set_timer_args(args)?;
+        self.timers
+            .set(seconds, label)
+            .map_err(|e| anyhow::anyhow!(e))?;
         Ok(format!("Timer set for {} seconds: {}", seconds, label))
     }
 
@@ -853,6 +1356,10 @@ impl ToolDispatcher {
         args: &serde_json::Value,
         exec_ctx: ToolExecutionContext,
     ) -> Result<String> {
+        let query = parse_memory_recall_query(args)?;
+        let read_context = exec_ctx
+            .memory_read_context
+            .unwrap_or_else(|| memory_read_context(args));
         let mem = self
             .memory
             .as_ref()
@@ -860,21 +1367,30 @@ impl ToolDispatcher {
         let mem = mem
             .lock()
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
-        let query = memory_query(args);
-        let read_context = exec_ctx
-            .memory_read_context
-            .unwrap_or_else(|| memory_read_context(args));
+        let query_ref = query.as_str();
 
-        let results = crate::memory::recall::recall_with_context(&mem, query, 10, read_context)?;
+        if let Some(answer) = mem.structured_household_answer(query_ref)? {
+            return Ok(answer);
+        }
+
+        if let Some(role) = household_role_query(query_ref) {
+            let profiles = mem.household_profiles_by_role(role)?;
+            if !profiles.is_empty() {
+                return Ok(format_household_role_answer(role, &profiles));
+            }
+        }
+
+        let results =
+            crate::memory::recall::recall_with_context(&mem, query_ref, 10, read_context)?;
         if results.is_empty() {
-            return Ok(match query {
+            return Ok(match query_ref {
                 "name" => "I don't remember your name yet.".to_string(),
                 "user" => "I don't remember anything about you yet.".to_string(),
                 other => format!("I don't remember anything about {} yet.", other),
             });
         }
 
-        if query == "name"
+        if query_ref == "name"
             && let Some(entry) = results
                 .iter()
                 .find(|entry| entry.entry.content.to_lowercase().contains("name is "))
@@ -885,7 +1401,7 @@ impl ToolDispatcher {
                 .replace("User's name is ", "Your name is "));
         }
 
-        if query == "user" || query == "me" {
+        if query_ref == "user" || query_ref == "me" {
             let items = results
                 .iter()
                 .take(3)
@@ -915,18 +1431,24 @@ impl ToolDispatcher {
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
         let health = mem.health()?;
         let promoted = mem.promoted_count()?;
-        let state = if health.quick_check_ok && health.fts_consistent {
+        let state = if health.quick_check_ok && health.fts_consistent && !health.migration_degraded
+        {
             "ok"
         } else {
             "degraded"
         };
 
         Ok(format!(
-            "Memory status: {}. Rows: {}. FTS rows: {}. FTS consistent: {}. Promoted memories: {}. Canonical root: {}. Namespace notes: {}. Daily notes: {}. Event logs: {}. Person-scoped memories: {}. Private memories: {}. Restricted memories: {}.",
+            "Memory status: {}. Rows: {}. FTS rows: {}. FTS consistent: {}. Migration degraded: {}. Promoted memories: {}. Canonical root: {}. Namespace notes: {}. Daily notes: {}. Event logs: {}. Person-scoped memories: {}. Private memories: {}. Restricted memories: {}.",
             state,
             health.memory_rows,
             health.fts_rows,
             if health.fts_consistent { "yes" } else { "no" },
+            if health.migration_degraded {
+                "yes"
+            } else {
+                "no"
+            },
             promoted,
             if health.canonical_root_exists {
                 "present"
@@ -942,7 +1464,19 @@ impl ToolDispatcher {
         ))
     }
 
-    fn exec_memory_forget(&self, args: &serde_json::Value) -> Result<String> {
+    fn exec_memory_forget(
+        &self,
+        args: &serde_json::Value,
+        exec_ctx: ToolExecutionContext,
+    ) -> Result<String> {
+        // Validate the argument at the execution boundary, before touching the
+        // memory backend, the same way exec_memory_recall does (PR #362). The
+        // previous `unwrap_or("")` silently coerced a missing or non-string
+        // `query` into "", and a whitespace-only query slipped past the
+        // `is_empty()` check straight into `mem.search("   ", ...)` — running a
+        // destructive forget on garbage input instead of being rejected and
+        // audited like its read-side sibling.
+        let query = parse_memory_forget_query(args)?;
         let mem = self
             .memory
             .as_ref()
@@ -950,13 +1484,24 @@ impl ToolDispatcher {
         let mem = mem
             .lock()
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
-        if query.is_empty() {
-            return Ok("Please specify what to forget.".to_string());
+        // Gate deletes through the same MemoryReadContext that exec_memory_recall
+        // uses. Without it, an LLM that cannot READ a person-scoped row could
+        // still DELETE it by calling memory_forget — destroying data it has no
+        // privilege to see. This mirrors the read-side fix landed in
+        // PR #201 (commit be4a2da).
+        let read_context = exec_ctx
+            .memory_read_context
+            .unwrap_or_else(crate::memory::policy::MemoryReadContext::shared_room_voice);
+        let candidates = mem.search(query, 10)?;
+        let allowed = crate::memory::recall::filter_recall_results(candidates, read_context);
+        let mut deleted = 0usize;
+        for recallable in &allowed {
+            if mem.delete_by_id(recallable.entry.id)? {
+                deleted += 1;
+            }
         }
 
-        let deleted = mem.delete_matching(query)?;
         if deleted == 0 {
             Ok(format!("No memories found matching '{}'.", query))
         } else {
@@ -965,6 +1510,8 @@ impl ToolDispatcher {
     }
 
     fn exec_memory_store(&self, args: &serde_json::Value) -> Result<String> {
+        // Validate content before the lock; previously a soft Ok() audited as success (#416).
+        let memories = parse_memory_store_content(args)?;
         let mem = self
             .memory
             .as_ref()
@@ -972,12 +1519,9 @@ impl ToolDispatcher {
         let mem = mem
             .lock()
             .map_err(|e| anyhow::anyhow!("memory lock: {}", e))?;
-        let memories = normalize_memories_to_store(args);
-        if memories.is_empty() {
-            return Ok("Please specify what to remember.".to_string());
-        }
 
         let mut stored = Vec::new();
+        let mut stored_categories = Vec::new();
         let mut rejected = Vec::new();
         let mut replaced = 0;
         for (category, content) in memories {
@@ -988,6 +1532,7 @@ impl ToolDispatcher {
             }
             let outcome = mem.store_resolved(&category, &content)?;
             replaced += outcome.replaced;
+            stored_categories.push(category);
             stored.push(content);
         }
 
@@ -997,6 +1542,38 @@ impl ToolDispatcher {
                 .copied()
                 .unwrap_or("I could not store that memory.")
                 .to_string());
+        }
+
+        if stored_categories
+            .iter()
+            .any(|category| category == "shopping")
+        {
+            let count = mem.shopping_list_pending_count().unwrap_or(0);
+            let removed = stored.iter().any(|content| {
+                content
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("shopping list removed:")
+            });
+            let added = stored
+                .iter()
+                .map(|content| {
+                    content
+                        .trim_start_matches("shopping list pending:")
+                        .trim_start_matches("shopping list removed:")
+                        .trim()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if removed {
+                return Ok(format!(
+                    "Removed {added} from the shopping list. You have {count} item(s) total."
+                ));
+            }
+            return Ok(format!(
+                "Added {added} to the shopping list. You have {count} item(s) total."
+            ));
         }
 
         if stored.len() == 1 {
@@ -1040,38 +1617,69 @@ impl ToolDispatcher {
         )
     }
 
-    fn exec_skill(&self, name: &str, args: &serde_json::Value) -> Result<String> {
+    async fn exec_skill(&self, name: &str, args: &serde_json::Value) -> Result<String> {
         let skills = self
             .skills
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", name))?;
-        let mut loader = skills
-            .lock()
-            .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
 
         let args_json = serde_json::to_string(args)?;
-        let (success, output) = {
+
+        // Build a Send invocation handle under a short lock, then drop the lock
+        // BEFORE awaiting the (possibly blocking) C call. The invocation owns an
+        // Arc to the skill's library, so the native code stays mapped for the
+        // whole call even though the loader lock is released. Holding a
+        // std::sync::Mutex guard across the await would both serialize every
+        // other skill access and trip clippy's `await_holding_lock`.
+        let invocation = {
+            let loader = skills
+                .lock()
+                .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
             let skill = loader
-                .get_mut(name)
+                .loaded()
+                .iter()
+                .find(|s| s.name == name)
                 .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", name))?;
-            skill.execute_parsed(&args_json)
+            skill.prepare(&args_json)
         };
 
-        let pruned = loader.prune_faulted();
-        if pruned.iter().any(|skill_name| skill_name == name) {
-            tracing::warn!(skill = name, "skill auto-unloaded after repeated faults");
+        let outcome = invocation.run().await;
+
+        // Re-acquire the lock to record the fault and reap a skill that has
+        // exceeded its fault budget. The skill may have been unloaded meanwhile;
+        // that is fine — the Arc kept its library alive for the call above.
+        {
+            let mut loader = skills
+                .lock()
+                .map_err(|e| anyhow::anyhow!("skill loader lock: {}", e))?;
+            if outcome.faulted
+                && let Some(skill) = loader.get_mut(name)
+            {
+                skill.fault_count += 1;
+            }
+            let pruned = loader.prune_faulted();
+            if pruned.iter().any(|skill_name| skill_name == name) {
+                tracing::warn!(skill = name, "skill auto-unloaded after repeated faults");
+            }
         }
 
-        if success {
-            Ok(output)
+        if outcome.success {
+            Ok(outcome.output)
         } else {
-            Err(anyhow::anyhow!("{}", output))
+            Err(anyhow::anyhow!("{}", outcome.output))
         }
     }
 
     async fn exec_play_media(&self, args: &serde_json::Value) -> Result<String> {
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        tracing::info!(query, "triggering media mode via governor control socket");
+        let query = parse_play_media_query(args)?;
+        let resolved = self.resolve_media_query(query);
+        tracing::info!(
+            query,
+            resolved_query = resolved.query.as_str(),
+            provider = resolved.provider.as_deref().unwrap_or("unknown"),
+            "triggering media mode via governor control socket"
+        );
+        write_media_request(&resolved).await;
 
         // Send media_start command to the governor via its Unix control socket.
         let response = governor_command(r#"{"cmd":"media_start"}"#).await;
@@ -1082,7 +1690,7 @@ impl ToolDispatcher {
                 if ok {
                     Ok(format!(
                         "Playing: {}. Switched to media mode — LLM unloaded, HDMI ready.",
-                        query
+                        resolved.display()
                     ))
                 } else {
                     let err = resp
@@ -1098,10 +1706,76 @@ impl ToolDispatcher {
                 tokio::fs::write("/run/geniepod/media_mode", b"1").await?;
                 Ok(format!(
                     "Playing: {}. Media mode triggered (file fallback).",
-                    query
+                    resolved.display()
                 ))
             }
         }
+    }
+
+    fn resolve_media_query(&self, query: &str) -> ResolvedMediaQuery {
+        let Some(memory) = &self.memory else {
+            return ResolvedMediaQuery::unresolved(query);
+        };
+        let Ok(memory) = memory.lock() else {
+            return ResolvedMediaQuery::unresolved(query);
+        };
+        match memory.media_playlist_for_query(query).ok().flatten() {
+            Some(item) => ResolvedMediaQuery {
+                query: item.name,
+                provider: item.provider,
+                target: Some(item.target),
+                source: "memory".into(),
+            },
+            None => ResolvedMediaQuery::unresolved(query),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ResolvedMediaQuery {
+    query: String,
+    provider: Option<String>,
+    target: Option<String>,
+    source: String,
+}
+
+impl ResolvedMediaQuery {
+    fn unresolved(query: &str) -> Self {
+        Self {
+            query: query.trim().to_string(),
+            provider: None,
+            target: None,
+            source: "query".into(),
+        }
+    }
+
+    fn display(&self) -> String {
+        match (&self.provider, &self.target) {
+            (Some(provider), Some(target))
+                if target
+                    .to_ascii_lowercase()
+                    .starts_with(&format!("{provider}:")) =>
+            {
+                format!("{} ({target})", self.query)
+            }
+            (Some(provider), Some(target)) => format!("{} ({provider}: {target})", self.query),
+            (_, Some(target)) => format!("{} ({target})", self.query),
+            _ => self.query.clone(),
+        }
+    }
+}
+
+pub fn tool_action_class(name: &str) -> ToolActionClass {
+    match name {
+        "home_control" | "home_undo" => ToolActionClass::HomeActuation,
+        "play_media" => ToolActionClass::Media,
+        "memory_recall" => ToolActionClass::MemoryRead,
+        "memory_forget" | "memory_store" => ToolActionClass::MemoryWrite,
+        "memory_status" | "system_info" | "action_history" => ToolActionClass::Diagnostic,
+        "web_search" | "get_weather" => ToolActionClass::Network,
+        "set_timer" => ToolActionClass::Timer,
+        "home_status" | "get_time" | "calculate" => ToolActionClass::ReadOnly,
+        _ => ToolActionClass::Skill,
     }
 }
 
@@ -1154,22 +1828,185 @@ fn actuation_rate_limit(config: &ActuationSafetyConfig, origin: RequestOrigin) -
         .unwrap_or(config.max_actions_per_minute)
 }
 
-fn memory_query(args: &serde_json::Value) -> &str {
-    let raw = args
-        .get("query")
-        .or_else(|| args.get("topic"))
-        .or_else(|| args.get("what"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("user");
+impl ToolRateLimiter {
+    fn check_and_record(&self, policy: &ToolPolicyConfig, tool: &str) -> Result<()> {
+        let Some(limit) = tool_rate_limit(policy, tool) else {
+            return Ok(());
+        };
+        if limit == 0 {
+            anyhow::bail!("tool '{}' is rate-limited to zero calls per minute", tool);
+        }
 
-    let lower = raw.to_lowercase();
-    if lower.contains("my name") || lower == "name" || lower.contains("who am i") {
-        "name"
-    } else if lower.contains("about me") || lower == "me" || lower == "user" {
-        "user"
-    } else {
-        raw
+        let now = now_ms();
+        let cutoff = now.saturating_sub(ACTUATION_RATE_WINDOW_MS);
+        let mut attempts = self.attempts.lock().expect("tool rate limiter lock");
+        let bucket = attempts.entry(tool.to_string()).or_default();
+        while bucket.front().copied().is_some_and(|ts| ts < cutoff) {
+            bucket.pop_front();
+        }
+        if bucket.len() >= limit {
+            anyhow::bail!("tool '{}' exceeded {} call(s) per minute", tool, limit);
+        }
+        bucket.push_back(now);
+        Ok(())
     }
+}
+
+/// Per-tool limit for `tool`, honoring an exact match first and a `"*"`
+/// catch-all fallback. `None` means the tool is unlimited.
+fn tool_rate_limit(policy: &ToolPolicyConfig, tool: &str) -> Option<usize> {
+    if !policy.enabled {
+        return None;
+    }
+    policy
+        .max_actions_per_minute_by_tool
+        .get(tool)
+        .or_else(|| policy.max_actions_per_minute_by_tool.get("*"))
+        .copied()
+}
+
+impl ToolConfirmationGate {
+    fn evaluate(
+        &self,
+        origin: RequestOrigin,
+        tool: &str,
+        args: &serde_json::Value,
+        ttl_ms: u64,
+        confirmed: bool,
+    ) -> ToolConfirmDecision {
+        let key = tool_confirmation_key(origin, tool, args);
+        let now = now_ms();
+        let mut pending = self.pending.lock().expect("tool confirmation gate lock");
+        pending.retain(|_, first_seen| {
+            now.saturating_sub(*first_seen) < TOOL_CONFIRMATION_RETENTION_MS
+        });
+
+        if !confirmed {
+            // First leg: record (or refresh) the request and ask for a repeat.
+            if pending.len() >= MAX_TOOL_CONFIRMATIONS
+                && !pending.contains_key(&key)
+                && let Some(oldest) = pending
+                    .iter()
+                    .min_by_key(|(_, first_seen)| **first_seen)
+                    .map(|(oldest_key, _)| oldest_key.clone())
+            {
+                pending.remove(&oldest);
+            }
+            pending.insert(key.clone(), now);
+            return ToolConfirmDecision::Pending {
+                token: tool_confirmation_token(&key),
+            };
+        }
+
+        // Confirming leg: succeed only when a matching first leg is still inside
+        // the TTL window. A missing or stale first leg reports as expired.
+        match pending.remove(&key) {
+            Some(first_seen) if now.saturating_sub(first_seen) <= ttl_ms => {
+                ToolConfirmDecision::Confirmed
+            }
+            _ => ToolConfirmDecision::Expired,
+        }
+    }
+}
+
+/// Whether `tool` is in `requires_confirmation_tools` (wildcards supported).
+/// Only consulted when the tool policy is enabled.
+fn tool_requires_confirmation(policy: &ToolPolicyConfig, tool: &str) -> bool {
+    policy.enabled
+        && policy
+            .requires_confirmation_tools
+            .iter()
+            .any(|entry| entry == "*" || entry.trim().eq_ignore_ascii_case(tool))
+}
+
+/// Stable key for a confirmable request: identical `(origin, tool, arguments)`
+/// triples map to the same key so the confirming leg matches its first leg.
+fn tool_confirmation_key(origin: RequestOrigin, tool: &str, args: &serde_json::Value) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        origin.as_policy_key(),
+        tool,
+        serde_json::to_string(args).unwrap_or_default()
+    )
+}
+
+/// Stable, non-secret token derived from the confirmation key. It only
+/// identifies the pending request (the args themselves are the authorization),
+/// so unlike a home-actuation token it is safe to surface to the caller.
+fn tool_confirmation_token(key: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    format!("conf-{:016x}", hasher.finish())
+}
+
+fn household_role_query(query: &str) -> Option<&'static str> {
+    let normalized = query
+        .trim()
+        .to_ascii_lowercase()
+        .replace(
+            |ch: char| !ch.is_ascii_alphanumeric() && !ch.is_whitespace(),
+            " ",
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let role = tokens
+        .iter()
+        .find_map(|token| normalize_household_role_query_token(token))?;
+
+    let is_role_question = normalized.starts_with("who is ")
+        || normalized.starts_with("who are ")
+        || normalized.starts_with("whos ")
+        || normalized.starts_with("who s ")
+        || normalized.contains(" in this house")
+        || normalized.contains(" in our house")
+        || normalized.contains(" household");
+    let is_direct_role_topic = tokens.len() == 1
+        || (tokens.len() == 2
+            && normalize_household_role_query_token(tokens[0]).is_some()
+            && matches!(tokens[1], "name" | "names"));
+
+    if is_role_question || is_direct_role_topic {
+        Some(role)
+    } else {
+        None
+    }
+}
+
+fn normalize_household_role_query_token(token: &str) -> Option<&'static str> {
+    match token {
+        "dad" | "father" => Some("dad"),
+        "mom" | "mother" | "mum" => Some("mom"),
+        "son" | "sons" => Some("son"),
+        "daughter" | "daughters" => Some("daughter"),
+        "child" | "children" | "kid" | "kids" => Some("child"),
+        "wife" => Some("wife"),
+        "husband" => Some("husband"),
+        "partner" => Some("partner"),
+        "dog" | "dogs" => Some("dog"),
+        "cat" | "cats" => Some("cat"),
+        "pet" | "pets" => Some("pet"),
+        _ => None,
+    }
+}
+
+fn format_household_role_answer(
+    role: &str,
+    profiles: &[crate::memory::HouseholdProfile],
+) -> String {
+    if profiles.len() == 1 {
+        return format!("{} is the {}.", profiles[0].name, role);
+    }
+
+    let names = profiles
+        .iter()
+        .map(|profile| profile.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{names} are the {role}s.")
 }
 
 fn memory_read_context(args: &serde_json::Value) -> crate::memory::policy::MemoryReadContext {
@@ -1316,10 +2153,7 @@ fn tool_argument_keys(args: &serde_json::Value) -> Vec<String> {
 }
 
 fn exec_calculate(args: &serde_json::Value) -> Result<String> {
-    let expr = args
-        .get("expression")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0");
+    let expr = parse_calculate_expression(args)?;
     match super::calc::evaluate(expr) {
         Ok(result) => {
             // Format nicely: drop trailing zeros for integers.
@@ -1334,14 +2168,8 @@ fn exec_calculate(args: &serde_json::Value) -> Result<String> {
 }
 
 async fn exec_weather(args: &serde_json::Value) -> Result<String> {
-    let location = args
-        .get("location")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Denver");
-    let forecast = args
-        .get("forecast")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let location = parse_get_weather_location(args)?;
+    let forecast = parse_get_weather_forecast(args)?;
 
     if forecast {
         super::weather::get_forecast(location).await
@@ -1351,17 +2179,8 @@ async fn exec_weather(args: &serde_json::Value) -> Result<String> {
 }
 
 async fn exec_web_search(args: &serde_json::Value, config: &WebSearchConfig) -> Result<String> {
-    let query = args
-        .get("query")
-        .or_else(|| args.get("q"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3)
-        .clamp(1, 5) as usize;
+    let query = parse_web_search_query(args)?;
+    let limit = parse_web_search_limit(args)?;
     let fresh = args
         .get("fresh")
         .or_else(|| args.get("cache_bypass"))
@@ -1420,6 +2239,19 @@ async fn governor_command(json_cmd: &str) -> Option<serde_json::Value> {
         .ok()?;
 
     line.and_then(|l| serde_json::from_str(&l).ok())
+}
+
+async fn write_media_request(request: &ResolvedMediaQuery) {
+    let result: Result<()> = async {
+        tokio::fs::create_dir_all("/run/geniepod").await?;
+        let json = serde_json::to_vec(request)?;
+        tokio::fs::write("/run/geniepod/media_request.json", json).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::debug!(error = %error, "media request sidecar write skipped");
+    }
 }
 
 #[cfg(test)]
@@ -1734,7 +2566,239 @@ mod tests {
         };
         let result = dispatcher.execute(&call).await;
         assert!(result.success);
+        assert_eq!(result.action_class, ToolActionClass::ReadOnly);
         assert!(!result.output.is_empty());
+    }
+
+    #[test]
+    fn home_control_canonicalizes_action_synonyms() {
+        // The bug: a small model emits "turn off" (space), the runtime rejected
+        // it, and a correct intent silently failed to actuate.
+        for (raw, want) in [
+            ("turn off", Some("turn_off")),
+            ("Turn-Off", Some("turn_off")),
+            ("deactivate", Some("turn_off")),
+            ("disable", Some("turn_off")),
+            ("turn on", Some("turn_on")),
+            ("switch_on", Some("turn_on")),
+            ("toggle", Some("toggle")),
+            ("activate", Some("activate")), // distinct action, must not remap
+            ("frobnicate", None),
+        ] {
+            assert_eq!(canon_home_control_action(raw), want, "action {raw:?}");
+        }
+
+        // End-to-end through the arg parser: "turn off" now resolves to "turn_off".
+        let args = serde_json::json!({"entity": "kitchen lights", "action": "turn off"});
+        let (entity, action, _) =
+            parse_home_control_args(&args).expect("'turn off' should canonicalize and parse");
+        assert_eq!(entity, "kitchen lights");
+        assert_eq!(action, "turn_off");
+    }
+
+    #[test]
+    fn home_control_value_must_be_numeric_when_provided() {
+        // A numeric value parses through to Some(..).
+        let args =
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": 72});
+        let (_, _, value) = parse_home_control_args(&args).expect("numeric value parses");
+        assert_eq!(value, Some(72.0));
+
+        // An absent value is a legitimate no-op None — value stays optional.
+        let args = serde_json::json!({"entity": "kitchen lights", "action": "turn_on"});
+        let (_, _, value) = parse_home_control_args(&args).expect("absent value parses");
+        assert_eq!(value, None);
+
+        // An explicit null is also None, not a rejection.
+        let args =
+            serde_json::json!({"entity": "kitchen lights", "action": "turn_on", "value": null});
+        let (_, _, value) = parse_home_control_args(&args).expect("null value parses");
+        assert_eq!(value, None);
+
+        // The bug: a provided but non-numeric value used to be silently dropped
+        // to None, so the action actuated without it. It must now be rejected.
+        for bad in [
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": "72"}),
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": true}),
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": [72]}),
+        ] {
+            let err = parse_home_control_args(&bad)
+                .expect_err("non-numeric value must be rejected")
+                .to_string();
+            assert!(
+                err.contains("home_control 'value' must be a number when provided"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_weather_forecast_must_be_boolean_when_provided() {
+        // A real boolean parses through.
+        let args = serde_json::json!({"location": "Denver", "forecast": true});
+        assert!(parse_get_weather_forecast(&args).expect("bool forecast parses"));
+
+        // Absent and explicit null both default to current weather (false),
+        // not a rejection — forecast stays optional.
+        assert!(
+            !parse_get_weather_forecast(&serde_json::json!({"location": "Denver"}))
+                .expect("absent forecast parses")
+        );
+        assert!(
+            !parse_get_weather_forecast(
+                &serde_json::json!({"location": "Denver", "forecast": null})
+            )
+            .expect("null forecast parses")
+        );
+
+        // The bug: a provided but non-boolean forecast (a stringified "true", a
+        // number) used to be silently dropped to false, returning current
+        // weather when the user asked for the forecast. It must now be rejected.
+        for bad in [
+            serde_json::json!({"location": "Denver", "forecast": "true"}),
+            serde_json::json!({"location": "Denver", "forecast": 1}),
+            serde_json::json!({"location": "Denver", "forecast": "yes"}),
+        ] {
+            let err = parse_get_weather_forecast(&bad)
+                .expect_err("non-boolean forecast must be rejected")
+                .to_string();
+            assert!(
+                err.contains("get_weather 'forecast' must be a boolean when provided"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_search_limit_must_be_integer_when_provided() {
+        // A valid integer parses through.
+        assert_eq!(
+            parse_web_search_limit(&serde_json::json!({"query": "rust", "limit": 5}))
+                .expect("integer limit parses"),
+            5
+        );
+
+        // Absent and explicit null both default to 3 — limit stays optional.
+        assert_eq!(
+            parse_web_search_limit(&serde_json::json!({"query": "rust"}))
+                .expect("absent limit parses"),
+            3
+        );
+        assert_eq!(
+            parse_web_search_limit(&serde_json::json!({"query": "rust", "limit": null}))
+                .expect("null limit parses"),
+            3
+        );
+
+        // A valid integer outside 1..=5 still clamps into range rather than
+        // erroring, preserving the prior lenient behavior for in-type values.
+        assert_eq!(
+            parse_web_search_limit(&serde_json::json!({"query": "rust", "limit": 0}))
+                .expect("zero clamps up"),
+            1
+        );
+        assert_eq!(
+            parse_web_search_limit(&serde_json::json!({"query": "rust", "limit": 99}))
+                .expect("large clamps down"),
+            5
+        );
+
+        // The bug: a provided but non-integer limit (a stringified "5", a float,
+        // a negative) used to be silently dropped to the default 3. It must now
+        // be rejected.
+        for bad in [
+            serde_json::json!({"query": "rust", "limit": "5"}),
+            serde_json::json!({"query": "rust", "limit": 2.5}),
+            serde_json::json!({"query": "rust", "limit": -1}),
+        ] {
+            let err = parse_web_search_limit(&bad)
+                .expect_err("non-integer limit must be rejected")
+                .to_string();
+            assert!(
+                err.contains("web_search 'limit' must be an integer when provided"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn home_control_set_actions_require_value() {
+        // set_brightness / set_temperature with a value parse through.
+        for ok in [
+            serde_json::json!({"entity": "kitchen light", "action": "set_brightness", "value": 60}),
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": 21}),
+        ] {
+            let (_, _, value) = parse_home_control_args(&ok).expect("value provided parses");
+            assert!(value.is_some());
+        }
+
+        // The bug (issue #421): a value-requiring action with NO value used to be
+        // silently defaulted by the provider (brightness 50 / temperature 20) and
+        // reported success. It must now be rejected at the boundary. Absent and
+        // explicit null both count as missing.
+        for bad in [
+            serde_json::json!({"entity": "kitchen light", "action": "set_brightness"}),
+            serde_json::json!({"entity": "kitchen light", "action": "set_brightness", "value": null}),
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature"}),
+            serde_json::json!({"entity": "thermostat", "action": "set_temperature", "value": null}),
+        ] {
+            let err = parse_home_control_args(&bad)
+                .expect_err("missing value must be rejected")
+                .to_string();
+            assert!(
+                err.contains("requires a numeric argument 'value'"),
+                "unexpected error: {err}"
+            );
+        }
+
+        // Non-value actions are unaffected: no value is the correct no-op.
+        for ok in [
+            serde_json::json!({"entity": "kitchen light", "action": "turn_on"}),
+            serde_json::json!({"entity": "front door", "action": "lock"}),
+            serde_json::json!({"entity": "movie night", "action": "activate"}),
+        ] {
+            let (_, _, value) = parse_home_control_args(&ok).expect("no-value action parses");
+            assert_eq!(value, None);
+        }
+    }
+
+    #[test]
+    fn action_requires_value_only_for_setpoint_actions() {
+        // Only the two numeric-setpoint actions require a value (#421).
+        for a in ["set_brightness", "set_temperature"] {
+            assert!(action_requires_value(a), "{a} should require a value");
+        }
+        for a in [
+            "turn_on", "turn_off", "toggle", "open", "close", "lock", "unlock", "activate",
+        ] {
+            assert!(!action_requires_value(a), "{a} must not require a value");
+        }
+    }
+
+    #[test]
+    fn tool_action_class_maps_side_effecting_tools() {
+        assert_eq!(
+            tool_action_class("home_control"),
+            ToolActionClass::HomeActuation
+        );
+        assert_eq!(
+            tool_action_class("memory_store"),
+            ToolActionClass::MemoryWrite
+        );
+        assert_eq!(
+            tool_action_class("memory_recall"),
+            ToolActionClass::MemoryRead
+        );
+        assert_eq!(tool_action_class("web_search"), ToolActionClass::Network);
+        assert_eq!(tool_action_class("custom_skill"), ToolActionClass::Skill);
+        assert_eq!(ToolActionClass::HomeActuation.as_str(), "home_actuation");
+    }
+
+    #[test]
+    fn household_role_query_ignores_non_role_topics() {
+        assert_eq!(household_role_query("who is the dad"), Some("dad"));
+        assert_eq!(household_role_query("dog name"), Some("dog"));
+        assert_eq!(household_role_query("hot dog recipe"), None);
     }
 
     #[tokio::test]
@@ -1763,6 +2827,7 @@ mod tests {
         let line = std::fs::read_to_string(&path).unwrap();
         let event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(event["tool"], "calculate");
+        assert_eq!(event["action_class"], "read_only");
         assert_eq!(event["origin"], "api");
         assert_eq!(event["success"], false);
         assert_eq!(event["argument_keys"], serde_json::json!(["expression"]));
@@ -1770,6 +2835,52 @@ mod tests {
         assert!(!line.contains("secret-token-value"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tool_audit_logger_disabled_appends_ok() {
+        let logger = ToolAuditLogger::default();
+        let event = ToolAuditEvent {
+            ts_ms: now_ms(),
+            tool: "calculate".into(),
+            action_class: ToolActionClass::ReadOnly,
+            origin: RequestOrigin::Api,
+            success: true,
+            decision: "executed",
+            duration_ms: 1,
+            argument_keys: vec!["expression".into()],
+            output_chars: 3,
+        };
+        assert!(logger.append(event).is_ok());
+    }
+
+    #[test]
+    fn tool_audit_logger_surfaces_blocked_parent_error() {
+        let blocker = std::env::temp_dir().join(format!(
+            "geniepod-tool-audit-blocker-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let logger = ToolAuditLogger::new(blocker.join("tool-audit.jsonl"));
+
+        let event = ToolAuditEvent {
+            ts_ms: now_ms(),
+            tool: "calculate".into(),
+            action_class: ToolActionClass::ReadOnly,
+            origin: RequestOrigin::Api,
+            success: true,
+            decision: "executed",
+            duration_ms: 1,
+            argument_keys: vec!["expression".into()],
+            output_chars: 3,
+        };
+        let err = logger.append(event).expect_err("append must fail");
+        assert!(matches!(
+            err,
+            AuditError::CreateDir(_) | AuditError::Open(_)
+        ));
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[tokio::test]
@@ -1820,6 +2931,52 @@ mod tests {
         assert!(history.success);
         assert!(history.output.contains("turn_on kitchen light"));
         assert!(history.output.contains("undo: turn_off"));
+    }
+
+    #[tokio::test]
+    async fn home_control_resolves_structured_device_alias() {
+        let db = std::env::temp_dir().join(format!(
+            "home-control-device-alias-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("fact", "Playroom lights maps to light.playroom")
+            .unwrap();
+
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher = ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider {
+            executed: executed.clone(),
+        })))
+        .with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let result = dispatcher
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_control".into(),
+                    arguments: serde_json::json!({
+                        "entity": "playroom lights",
+                        "action": "turn_on"
+                    }),
+                },
+                ToolExecutionContext {
+                    request_origin: RequestOrigin::Dashboard,
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(*executed.lock().unwrap(), vec![HomeActionKind::TurnOn]);
+
+        let history = dispatcher
+            .execute(&ToolCall {
+                name: "action_history".into(),
+                arguments: serde_json::json!({}),
+            })
+            .await;
+        assert!(history.output.contains("turn_on light.playroom"));
     }
 
     #[tokio::test]
@@ -2098,6 +3255,45 @@ mod tests {
     }
 
     #[test]
+    fn memory_store_adds_shopping_list_items_with_count() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-store-shopping-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let result = dispatcher
+            .exec_memory_store(&serde_json::json!({
+                "content": "shopping list pending: milk, eggs",
+                "category": "shopping"
+            }))
+            .unwrap();
+
+        assert!(result.contains("Added milk, eggs"));
+        assert!(result.contains("2 item"));
+
+        {
+            let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+            assert_eq!(mem.shopping_list_pending_count().unwrap(), 2);
+        }
+
+        let result = dispatcher
+            .exec_memory_store(&serde_json::json!({
+                "content": "shopping list removed: milk",
+                "category": "shopping"
+            }))
+            .unwrap();
+        assert!(result.contains("Removed milk"));
+        assert!(result.contains("1 item"));
+
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        assert_eq!(mem.shopping_list_pending_count().unwrap(), 1);
+    }
+
+    #[test]
     fn memory_store_rejects_high_risk_secret() {
         let db = std::env::temp_dir().join(format!(
             "memory-store-secret-test-{}.db",
@@ -2122,6 +3318,30 @@ mod tests {
     }
 
     #[test]
+    fn memory_store_rejects_household_access_code() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-store-access-code-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let result = dispatcher
+            .exec_memory_store(&serde_json::json!({
+                "content": "remember that the gate code is 5829",
+                "category": "fact"
+            }))
+            .unwrap();
+
+        assert!(result.contains("should not store household access codes"));
+
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        assert!(mem.search("gate", 5).unwrap().is_empty());
+    }
+
+    #[test]
     fn memory_recall_formats_name_answers_naturally() {
         let db = std::env::temp_dir().join(format!("memory-recall-test-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&db);
@@ -2138,6 +3358,281 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, "Your name is Jared");
+    }
+
+    #[test]
+    fn memory_recall_accepts_topic_alias_after_schema_validation() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-topic-alias-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory.store("preference", "User likes jazz music").unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"topic": "jazz"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("jazz"));
+    }
+
+    #[test]
+    fn memory_recall_answers_household_role_from_structured_profile() {
+        let db =
+            std::env::temp_dir().join(format!("memory-recall-role-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory.store("relationship", "Jared is the dad").unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "who is the father in this house"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert_eq!(output, "Jared is the dad.");
+    }
+
+    #[test]
+    fn memory_recall_answers_structured_household_rule() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-structured-rule-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("fact", "Leo is not allowed to play video games after 8 PM")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "is Leo allowed to play video games after 8 PM"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.starts_with("No."));
+        assert!(output.contains("Leo is not allowed"));
+    }
+
+    #[test]
+    fn memory_recall_answers_calendar_and_access_permission() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-calendar-access-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "calendar",
+                "Mia has piano lessons today at 4:00 PM with Mrs. Higgins",
+            )
+            .unwrap();
+        memory
+            .store(
+                "access_permission",
+                "Leo is not authorized to unlock the front door. He can only unlock the side door",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let calendar = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "does Mia have piano lessons today"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+        assert!(calendar.contains("Mia"));
+        assert!(calendar.contains("piano"));
+
+        let access = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "can Leo unlock the front door"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+        assert!(access.starts_with("No."));
+        assert!(access.contains("front door"));
+    }
+
+    #[test]
+    fn memory_recall_answers_typed_household_note() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-household-note-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("note", "Bike lock hangs on the garage hook")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "find my note about bicycle lock"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("garage hook"));
+    }
+
+    #[test]
+    fn memory_recall_answers_app_only_secret_reference_without_value() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-secret-ref-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "credential_reference",
+                "Guest Wi-Fi password is stored in credential:guest_wifi",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "what is our wifi password for guests"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("app-only reference"));
+        assert!(!output.contains("credential:guest_wifi"));
+    }
+
+    #[test]
+    fn memory_recall_answers_semantic_home_comfort_query() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-semantic-comfort-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "preference",
+                "Jared prefers the living room thermostat at 72F.",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "I'm feeling cold"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("thermostat"));
+        assert!(output.contains("72F"));
+    }
+
+    #[test]
+    fn memory_recall_answers_semantic_lunchbox_query() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-semantic-lunchbox-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "shopping",
+                "Leo's lunchbox snacks include granola bars and fruit snacks.",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "We need more snacks for Leo's lunchbox"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("granola bars"));
+        assert!(output.contains("fruit snacks"));
+    }
+
+    #[test]
+    fn memory_recall_answers_semantic_movie_query() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-recall-semantic-movie-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "note",
+                "Watched The Iron Giant with the kids - they loved it.",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_recall(
+                &serde_json::json!({"query": "what was the movie about a robot that wanted to be a real boy"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(output.contains("Iron Giant"));
+    }
+
+    #[test]
+    fn play_media_resolves_playlist_from_memory() {
+        let db = std::env::temp_dir().join(format!(
+            "media-profile-dispatch-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store(
+                "media_profile",
+                "Jared's Morning Boost playlist is spotify:playlist:morning_boost",
+            )
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let resolved = dispatcher.resolve_media_query("play my Morning Boost playlist");
+
+        assert_eq!(resolved.query, "Morning Boost");
+        assert_eq!(resolved.provider.as_deref(), Some("spotify"));
+        assert_eq!(
+            resolved.target.as_deref(),
+            Some("spotify:playlist:morning_boost")
+        );
+        assert_eq!(
+            resolved.display(),
+            "Morning Boost (spotify:playlist:morning_boost)"
+        );
     }
 
     #[test]
@@ -2189,6 +3684,88 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, "I remember: Maya likes oat milk");
+    }
+
+    #[test]
+    fn memory_forget_blocks_person_scope_without_verified_context() {
+        // Regression for the delete-side analogue of be4a2da (PR #201): without a
+        // verified MemoryReadContext, the LLM must not be able to destroy
+        // person-scoped rows it cannot read. memory_forget previously called
+        // Memory::delete_matching directly (scope-blind), so an LLM that could
+        // not READ Maya's person_preference could still DELETE it.
+        let db = std::env::temp_dir().join(format!(
+            "memory-forget-shared-room-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("person_preference", "Maya likes oat milk")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_forget(
+                &serde_json::json!({"query": "Maya"}),
+                ToolExecutionContext::default(),
+            )
+            .unwrap();
+
+        assert!(
+            output.contains("No memories"),
+            "shared-room delete must report no-match, got: {output}"
+        );
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        let still_there = mem.search("Maya", 5).unwrap();
+        assert_eq!(
+            still_there.len(),
+            1,
+            "person-scoped row must remain after a shared-room forget"
+        );
+    }
+
+    #[test]
+    fn memory_forget_allows_person_scope_with_verified_context() {
+        // Mirror of the read-side identity-context unlock: when the server /
+        // voice pipeline has set a verified MemoryReadContext on exec_ctx,
+        // memory_forget should be able to delete person-scoped rows.
+        let db = std::env::temp_dir().join(format!(
+            "memory-forget-identity-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory
+            .store("person_preference", "Maya likes oat milk")
+            .unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        let output = dispatcher
+            .exec_memory_forget(
+                &serde_json::json!({"query": "Maya"}),
+                ToolExecutionContext {
+                    memory_read_context: Some(crate::memory::policy::MemoryReadContext {
+                        identity_confidence: crate::memory::policy::IdentityConfidence::High,
+                        explicit_named_person: false,
+                        explicit_private_intent: false,
+                        shared_space_voice: true,
+                    }),
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .unwrap();
+
+        assert!(
+            output.contains("Forgot 1"),
+            "verified-context delete must report success, got: {output}"
+        );
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        assert!(
+            mem.search("Maya", 5).unwrap().is_empty(),
+            "person-scoped row must be deleted under a verified context"
+        );
     }
 
     #[tokio::test]
@@ -2251,6 +3828,7 @@ mod tests {
         assert!(output.contains("Memory status: ok"));
         assert!(output.contains("Rows: 1"));
         assert!(output.contains("FTS consistent: yes"));
+        assert!(output.contains("Migration degraded: no"));
         assert!(output.contains("Canonical root:"));
         assert!(output.contains("Daily notes: 1"));
         assert!(output.contains("Event logs: 1"));
@@ -2330,18 +3908,19 @@ mod tests {
         }
     }
 
-    /// Pull the `act-…` confirmation token out of the "Confirmation required"
-    /// message that `home_control` emits when the policy gate returns
-    /// `ConfirmationRequired`.
-    fn extract_confirmation_token(output: &str) -> String {
-        let marker = "Pending token: ";
-        let start = output
-            .find(marker)
-            .unwrap_or_else(|| panic!("no confirmation token in output: {output:?}"))
-            + marker.len();
-        let tail = &output[start..];
-        let end = tail.find('.').unwrap_or(tail.len());
-        tail[..end].trim().to_string()
+    /// Fetch the freshest pending confirmation token from the dispatcher.
+    ///
+    /// The token is deliberately NOT echoed into `home_control`'s tool output
+    /// (it is a bearer secret), so tests read it from the same channel the
+    /// dashboard uses — the pending-confirmations list — rather than scraping
+    /// the LLM-visible string.
+    fn latest_confirmation_token(dispatcher: &ToolDispatcher) -> String {
+        dispatcher
+            .pending_confirmations()
+            .into_iter()
+            .max_by_key(|item| item.created_ms)
+            .map(|item| item.token)
+            .expect("a pending confirmation must exist")
     }
 
     /// Read the actuation audit JSONL written via `with_actuation_audit_path`
@@ -2393,7 +3972,12 @@ mod tests {
             )
             .await;
         assert!(issued.success, "issuing confirmation must succeed");
-        let token = extract_confirmation_token(&issued.output);
+        assert!(
+            !issued.output.contains("act-"),
+            "raw bearer token must not be echoed into tool output: {:?}",
+            issued.output
+        );
+        let token = latest_confirmation_token(&dispatcher);
         let executed_output = dispatcher
             .confirm_pending_home_action(&token)
             .await
@@ -2449,7 +4033,7 @@ mod tests {
             )
             .await;
         assert!(first_issue.success);
-        let first_token = extract_confirmation_token(&first_issue.output);
+        let first_token = latest_confirmation_token(&dispatcher);
 
         // Confirming that first request must succeed: the bucket already paid
         // its single slot on the request, the confirmation must not double-
@@ -2526,7 +4110,7 @@ mod tests {
             )
             .await;
         assert!(first_issue.success);
-        let first_token = extract_confirmation_token(&first_issue.output);
+        let first_token = latest_confirmation_token(&dispatcher);
         dispatcher
             .confirm_pending_home_action(&first_token)
             .await

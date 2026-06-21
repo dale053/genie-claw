@@ -2,8 +2,8 @@ mod genie_ai_runtime;
 mod llama_cpp;
 mod mock;
 mod openai_compat;
+mod openai_compatible;
 mod provider;
-mod retry;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -12,10 +12,9 @@ use genie_common::config::{LlmBackendKind, ServiceEndpoint};
 pub use genie_ai_runtime::GenieAiRuntimeBackend;
 pub use llama_cpp::LlamaCppBackend;
 pub use mock::MockLlmBackend;
-pub use openai_compat::{Message, ResponseFormat};
+pub use openai_compat::{LlmTimeouts, Message, ResponseFormat};
+pub use openai_compatible::OpenAiCompatibleBackend;
 pub use provider::{OptionalProviderPlan, ProviderReadiness};
-#[allow(unused_imports)]
-pub use retry::RetryLlmClient;
 
 #[async_trait]
 pub trait LlmBackendClient: Send + Sync {
@@ -116,9 +115,26 @@ impl LlmClient {
     }
 
     pub fn from_service_config(service: &ServiceEndpoint) -> Self {
+        Self::from_service_config_with_timeouts(service, LlmTimeouts::default())
+    }
+
+    /// Build the configured backend with explicit network timeouts.
+    ///
+    /// Production callers thread the operator-configured timeouts in here so
+    /// every chat call site (web, OpenAI bridge, voice, REPL, Telegram)
+    /// inherits a bounded read — the fix for issue #181, where an unbounded
+    /// read could hold the chat turn lock forever.
+    pub fn from_service_config_with_timeouts(
+        service: &ServiceEndpoint,
+        timeouts: LlmTimeouts,
+    ) -> Self {
         match service.backend {
-            LlmBackendKind::LlamaCpp => Self::from_llama_cpp_url(&service.url),
-            LlmBackendKind::GenieAiRuntime => Self::from_genie_ai_runtime_url(&service.url),
+            LlmBackendKind::LlamaCpp => {
+                Self::from_llama_cpp_url_with_timeouts(&service.url, timeouts)
+            }
+            LlmBackendKind::GenieAiRuntime => {
+                Self::from_genie_ai_runtime_url_with_timeouts(&service.url, timeouts)
+            }
         }
     }
 
@@ -134,6 +150,12 @@ impl LlmClient {
         }
     }
 
+    pub fn from_llama_cpp_url_with_timeouts(url: &str, timeouts: LlmTimeouts) -> Self {
+        Self {
+            backend: Box::new(LlamaCppBackend::from_url_with_timeouts(url, timeouts)),
+        }
+    }
+
     pub fn genie_ai_runtime(host: &str, port: u16) -> Self {
         Self {
             backend: Box::new(GenieAiRuntimeBackend::new(host, port)),
@@ -143,6 +165,59 @@ impl LlmClient {
     pub fn from_genie_ai_runtime_url(url: &str) -> Self {
         Self {
             backend: Box::new(GenieAiRuntimeBackend::from_url(url)),
+        }
+    }
+
+    pub fn from_genie_ai_runtime_url_with_timeouts(url: &str, timeouts: LlmTimeouts) -> Self {
+        Self {
+            backend: Box::new(GenieAiRuntimeBackend::from_url_with_timeouts(url, timeouts)),
+        }
+    }
+
+    pub fn from_openai_compatible_url_with_bearer_token(url: &str, token: impl AsRef<str>) -> Self {
+        Self::from_openai_compatible_url_with_bearer_token_and_timeouts(
+            url,
+            token,
+            LlmTimeouts::default(),
+        )
+    }
+
+    pub fn from_openai_compatible_url_with_bearer_token_and_timeouts(
+        url: &str,
+        token: impl AsRef<str>,
+        timeouts: LlmTimeouts,
+    ) -> Self {
+        Self {
+            backend: Box::new(
+                OpenAiCompatibleBackend::from_url_with_bearer_token_and_timeouts(
+                    url, token, timeouts,
+                ),
+            ),
+        }
+    }
+
+    pub fn from_openai_compatible_url_with_bearer_token_env(
+        url: &str,
+        env_var: impl AsRef<str>,
+    ) -> Self {
+        Self::from_openai_compatible_url_with_bearer_token_env_and_timeouts(
+            url,
+            env_var,
+            LlmTimeouts::default(),
+        )
+    }
+
+    pub fn from_openai_compatible_url_with_bearer_token_env_and_timeouts(
+        url: &str,
+        env_var: impl AsRef<str>,
+        timeouts: LlmTimeouts,
+    ) -> Self {
+        Self {
+            backend: Box::new(
+                OpenAiCompatibleBackend::from_url_with_bearer_token_env_and_timeouts(
+                    url, env_var, timeouts,
+                ),
+            ),
         }
     }
 
@@ -261,6 +336,15 @@ mod tests {
     fn can_construct_genie_ai_runtime_client() {
         let client = LlmClient::from_genie_ai_runtime_url("http://127.0.0.1:8080/health");
         assert_eq!(client.backend_name(), "genie-ai-runtime");
+    }
+
+    #[test]
+    fn can_construct_openai_compatible_bearer_client() {
+        let client = LlmClient::from_openai_compatible_url_with_bearer_token(
+            "http://127.0.0.1:8080/v1",
+            "oauth-token",
+        );
+        assert_eq!(client.backend_name(), "openai-compatible");
     }
 
     #[test]

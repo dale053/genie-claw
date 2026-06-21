@@ -2,44 +2,60 @@
 
 ## Purpose
 
-GenieClaw is the limited-context local agent layer for GeniePod Home and the
-broader Genie ecosystem.
+GenieClaw is the limited-context local agent layer native to NVIDIA Jetson Orin
+8GB and the broader Genie ecosystem.
 
 The repo is optimized around a narrow goal:
 
 - run locally on Jetson-class hardware as the flagship target
+- maintain Raspberry Pi and generic portable SBC profiles for the headless
+  agent, memory, tools, HTTP/CLI, and home-provider boundaries
 - preserve a 4096-token small-context baseline before larger adaptive contexts
+- favor low latency over larger default context windows
+- tune accuracy through family memory, current home state, and typed tools
 - keep the system understandable and debuggable
 - keep agent/provider/home behavior testable through deterministic harnesses
 - provide everyday household usefulness before broad platform ambition
 - preserve privacy, bounded behavior, and graceful degradation
 
 This is not a cloud orchestration shell and not a generic agent runtime. Remote
-or API-key providers can be useful optional adapters, but they must fit the
-limited-context home-agent contract rather than redefine the product.
+or API-key providers can be useful optional adapters for development, CI, and
+transitional validation, but they must fit the limited-context home-agent
+contract rather than redefine the product.
 
 ## Ecosystem Role
 
 The long-term Genie stack is split by responsibility:
 
 - custom Jetson hardware
-- `genie-os` for custom L4T, drivers, OTA, diagnostics, and service supervision
-- `genie-voice-runtime` for wake/VAD/STT/TTS/audio streaming and voice session events
-- `genie-home-runtime` for device graph, automations, MCP, and final actuation safety
+- a platform/OS layer for custom L4T, drivers, OTA, diagnostics, and service supervision
+- an external voice boundary for wake/VAD/STT/TTS/audio streaming and voice session events
+- an external home boundary for device graph, automations, MCP, and final actuation safety
 - `genie-ai-runtime` for Jetson-only LLM inference optimization
 - `genie-claw` for agent policy, memory, tools, skills, smart-home intent, and interaction
 - web/mobile apps for setup, control, memory management, and confirmations
 
-This repository is `genie-claw`. Some current integrations still live here as
-transitional adapters, especially `llama.cpp` and Home Assistant, but the code
-should keep those behind narrow boundaries.
+This repository is `genie-claw`. It integrates with external lower runtimes
+through narrow clients: `genie-ai-runtime` is the Jetson default LLM backend,
+`llama.cpp` remains a selectable development/fallback backend, and Home
+Assistant is the current transitional home provider.
+
+The Jetson profile is the native product path. The `raspberry_pi` and
+`portable_sbc` profiles are maintained compatibility targets for smaller
+on-device installs where Jetson-only voice, CUDA, or service behavior may be
+absent.
+
+The intended accuracy path is a compact home context harness: identity and
+family facts, relevant memories, device graph slices, recent actions, and
+safety policy are selected before each turn instead of dumping raw history or
+using remote context as a shortcut.
 
 For the exact implemented/partial/planned breakdown, use
 [implementation-status.md](implementation-status.md). In short, this repo
 implements the agent runtime, memory, tools, a transitional voice adapter,
 local HTTP/CLI surfaces, safety gates, and deploy assets. It does not implement
-the final `genie-voice-runtime`, `genie-home-runtime`, `genie-ai-runtime`,
-`genie-os`, or full Matter/Thread device stack.
+the final voice runtime, home runtime, `genie-ai-runtime`, platform/OS layer,
+or full Matter/Thread device stack.
 
 ## Main Runtime Modes
 
@@ -53,7 +69,7 @@ the final `genie-voice-runtime`, `genie-home-runtime`, `genie-ai-runtime`,
    daemon-only behavior.
 3. Voice mode
    Enabled by config, `--voice`, or `GENIEPOD_VOICE=1`. Today this still uses a
-   transitional in-repo voice path. Long term, `genie-voice-runtime` owns
+   transitional in-repo voice path. Long term, the external voice boundary owns
    microphone -> STT and TTS -> speaker, while GenieClaw owns transcript ->
    prompt/tool execution -> response text.
 
@@ -64,7 +80,7 @@ In daemon mode, Telegram can also be enabled as a side-channel adapter.
 Typical Jetson deployment:
 
 ```text
-llama-server (:8080)
+genie-ai-runtime (:8080)
         ^
         |
 genie-core (:3000) <---- genie-ctl
@@ -73,6 +89,9 @@ genie-core (:3000) <---- genie-ctl
         +---- optional Telegram adapter
         +---- optional Home Assistant provider
         +---- optional ESP32-C6 connectivity controller boundary
+
+Selectable fallback: llama.cpp `llama-server` can also serve the same
+OpenAI-compatible LLM endpoint on `:8080`.
 
 genie-governor ---- controls service modes and pressure response
 genie-health   ---- polls health endpoints and stores health history
@@ -85,7 +104,7 @@ Target topology:
 genie-ai-runtime
         ^
         |
-genie-voice-runtime
+external voice boundary
         ^
         |
 genie-claw
@@ -93,11 +112,15 @@ genie-claw
         +---- web/mobile apps and local channels
         +---- memory, tools, skills
         v
-genie-home-runtime
+external home boundary
         |
         v
-GenieOS + custom Jetson hardware
+platform/OS + custom Jetson hardware
 ```
+
+The target home runtime owns direct local IoT interfaces and the final physical
+actuation gate. GenieClaw owns the agent decision, memory, confirmation, and
+audit layers above that boundary.
 
 ## Core User Flows
 

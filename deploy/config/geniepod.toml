@@ -5,19 +5,27 @@ data_dir = "/opt/geniepod/data"
 
 [agent]
 runtime_profile = "jetson"        # "jetson", "raspberry_pi", "portable_sbc", "laptop", or "mac".
+                                  # Jetson is flagship; raspberry_pi and
+                                  # portable_sbc are maintained headless/SBC
+                                  # profiles for agent, memory, tools, and
+                                  # home-provider boundaries.
 context_window_tokens = 4096      # Non-negotiable Jetson baseline before any adaptive larger context.
 ai_runtime_boundary = "external_runtime"       # genie-ai-runtime owns inference.
-voice_runtime_boundary = "transitional_adapter" # In-repo voice path is temporary; target is genie-voice-runtime.
-home_runtime_boundary = "transitional_adapter"  # HA provider today; target is genie-home-runtime.
+voice_runtime_boundary = "transitional_adapter" # In-repo voice path is temporary; target is the external voice boundary.
+home_runtime_boundary = "transitional_adapter"  # HA provider today; target is the external home boundary.
 
-# Optional API-key provider path. Disabled by default so the local Jetson image
-# and binary stay focused on genie-ai-runtime. Enable only after the provider
-# passes the same 4096-token home-agent harness.
+# Optional API/OAuth provider path. Disabled by default so the local Jetson
+# image and binary stay focused on genie-ai-runtime. This exists for better
+# testing, development portability, and transitional validation only; it is not
+# the product runtime. Enable only after the provider passes the same
+# 4096-token home-agent harness.
 [optional_ai_provider]
 enabled = false
 provider = "open_ai_compatible"   # "open_ai_compatible", "open_ai", "anthropic", "gemini", or "custom".
+auth_mode = "api_key"             # "api_key" or "oauth_bearer" (OAuth access token in oauth_token_env).
 base_url = ""
 api_key_env = "GENIEPOD_AI_PROVIDER_API_KEY"
+oauth_token_env = "GENIEPOD_AI_PROVIDER_OAUTH_TOKEN"
 context_window_tokens = 4096
 allow_remote_base_url = false
 
@@ -27,6 +35,8 @@ bind_host = "127.0.0.1"           # Safer default. Use "0.0.0.0" only behind a t
 ha_token = ""                     # Only needed when Home Assistant service is enabled below. Or set HA_TOKEN env var.
 llm_model_name = "qwen"           # For prompt optimization. Options: nemotron-4b, tinyllama, llama, qwen, phi, gemma
                                   # alpha.9 default: Qwen3-4B Q4_K_M + genie-ai-runtime.
+llm_model_name = "qwen"           # For prompt optimization. Options: nemotron-4b, tinyllama, llama, qwen, phi
+                                  # Jetson default: Qwen3-4B Q4_K_M + genie-ai-runtime.
                                   # Phi-4-mini fallback (issue #44):
                                   #   1) deploy/setup-jetson.sh --model phi-4-mini
                                   #   2) flip the two lines below:
@@ -48,7 +58,7 @@ llm_model_name = "qwen"           # For prompt optimization. Options: nemotron-4
                                   #   Gemma 4 inference support (SentencePiece tokenizer,
                                   #   <start_of_turn>/<end_of_turn> chat template).
                                   # (see ARCHITECTURE.md "Current Transitional Adapters".)
-whisper_model = "/opt/geniepod/models/ggml-small.bin"   # alpha.5 default — with the
+whisper_model = "/opt/geniepod/models/ggml-small.bin"   # With the
                                   # long-running whisper-server (genie-whisper.service)
                                   # this model stays resident in iGPU memory, so per-call
                                   # STT is ~500 ms on Orin Nano (good for conversational
@@ -56,7 +66,7 @@ whisper_model = "/opt/geniepod/models/ggml-small.bin"   # alpha.5 default — wi
                                   # accuracy) for max responsiveness, or ggml-base.bin
                                   # (~200 ms) for a middle ground. Keep the genie-whisper
                                   # systemd unit's GENIEPOD_WHISPER_MODEL in sync.
-whisper_port = 8178               # alpha.5: long-running whisper-server via
+whisper_port = 8178               # Long-running whisper-server via
                                   # genie-whisper.service. Model stays in GPU memory
                                   # so per-utterance latency is ~50 ms instead of ~1.5 s
                                   # cold-start. Set to 0 to fall back to spawning
@@ -70,8 +80,12 @@ stt_language = "en"               # Whisper decoder hint. Forcing "en" uses the
                                   # multilingual / non-English installs.
 piper_model = "/opt/geniepod/voices/en_US-amy-medium.onnx"
 piper_path = "/opt/geniepod/piper/piper"
-piper_pipe_mode = false           # true = long-running subprocess (lower latency).
-max_history_turns = 20
+piper_pipe_mode = true            # true = long-running subprocess (lower latency).
+max_history_turns = 4
+llm_connect_timeout_secs = 10     # Max wait to open the TCP connection to the LLM backend.
+llm_read_timeout_secs = 60        # Max idle seconds between tokens/bytes before a read is abandoned.
+                                  #   Bounds every backend read so one hung read can't wedge all chat.
+llm_request_timeout_secs = 120    # Max seconds for a non-streaming completion (whole generation).
 expected_runtime_contract_hash = ""  # Optional: pin after a known-good boot to detect prompt/tool/policy drift.
 audio_device = "auto"             # CAPTURE/microphone device.
                                   # Auto-detect: prefers Tegra APE (LyraT/I2S2) if routed,
@@ -98,13 +112,13 @@ audio_sample_rate = 24000         # Match the AHUB's I2S2 Sample Rate (24 kHz on
                                   # ~1 s wall-clock). whisper-server resamples to
                                   # 16 kHz internally so STT is unaffected.
 audio_denoiser = "deepfilternet"  # Capture-side noise reduction backend. Options:
-                                  #   "deepfilternet" — neural denoiser (alpha.7, issue #12).
+                                  #   "deepfilternet" — neural denoiser.
                                   #                     Handles non-stationary noise
                                   #                     (fan cycling, typing, background
                                   #                     voices) without a noise profile.
                                   #                     Run setup-jetson.sh to fetch the
                                   #                     binary into deep_filter_path.
-                                  #   "sox"           — alpha.6 baseline; spectral
+                                  #   "sox"           — spectral
                                   #                     subtraction against a profile
                                   #                     captured in setup-jetson.sh,
                                   #                     plus compand quiet-speech lift.
@@ -112,7 +126,7 @@ audio_denoiser = "deepfilternet"  # Capture-side noise reduction backend. Option
                                   # Falls back to "sox" then "none" at runtime if the
                                   # configured backend's binary is missing.
 deep_filter_path = "/opt/geniepod/bin/deep-filter"
-deep_filter_atten_lim_db = 100.0  # DeepFilterNet attenuation limit (--atten-lim). 100.0 =
+deep_filter_atten_lim_db = 25.0   # DeepFilterNet attenuation limit (--atten-lim). 100.0 =
                                   # full denoising (upstream default). Lower values mix
                                   # the noisy signal back in — drop to ~30 if DFN
                                   # over-suppresses quiet phonemes.
@@ -125,9 +139,9 @@ post_tts_silence_ms = 1500        # Half-duplex gate (issue #15): ms to wait aft
                                   # transcribes the assistant's voice as the next "user"
                                   # utterance. Set to 0 on installs with full physical
                                   # isolation (headphones / headset).
-voice_enabled = true              # Voice mode on by default in alpha.5 (push-to-talk).
+voice_enabled = true              # Voice mode on by default (push-to-talk unless wakeword_script is set).
                                   # Set false on hosts without whisper/piper installed.
-voice_record_secs = 3             # Seconds to record per voice interaction. Most
+voice_record_secs = 5             # Seconds to record per voice interaction. Most
                                   # household commands ("what time is it", "turn on
                                   # kitchen light") fit in 3 s; raise if you regularly
                                   # ask longer multi-clause questions.
@@ -136,7 +150,7 @@ voice_continuous_secs = 3         # Shorter recording for follow-up conversation
 llm_model_path = "/opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf"  # For GPU time-sharing in voice mode.
                                   # Phi-4-mini fallback (issue #44):
                                   # llm_model_path = "/opt/geniepod/models/phi-4-mini-instruct-q4_k_m.gguf"
-wakeword_script = ""              # Empty = push-to-talk (alpha.5 default).
+wakeword_script = ""              # Empty = push-to-talk.
                                   # Set to "/opt/geniepod/bin/genie-wake-listen.py" once
                                   # wake-word detection is validated for your install.
 
@@ -160,15 +174,34 @@ wakeword_script = ""              # Empty = push-to-talk (alpha.5 default).
 # local skills keep loading; enable these after manifests/signatures are ready.
 # [core.skill_policy]
 # require_manifest = false
-# require_signature = false
+# require_signature = false   # when true, only skills whose .so bytes are
+#                             # verified by a trusted Ed25519 key load (checked
+#                             # before dlopen); a non-empty signature string is
+#                             # not enough. Fails closed with no trusted keys.
+# signature_key_dir = "/etc/geniepod/skill-keys"  # holds <key_id>.pub keys
 # denied_permissions = ["network.raw", "filesystem.write"]
+# skill_execution_timeout_ms = 30000   # deadline for one native skill call.
+#                             # The C ABI call runs on a blocking thread; if it
+#                             # overruns this budget the call is abandoned and a
+#                             # timeout fault is returned, so a hung skill can't
+#                             # freeze the async executor (health, voice, etc.).
 
 # Optional per-origin tool policy. Defaults are allow unless a rule exists.
 # Use "*" as a wildcard origin or tool name. Deny rules override allow rules.
+# Every tool call (quick-tool, LLM dispatch, skill, summary) is enforced at one
+# dispatcher gate, so these rules apply uniformly regardless of how a tool runs.
 # [core.tool_policy]
 # enabled = true
 # allowed_tools_by_origin = { voice = ["get_time", "get_weather", "memory_recall", "home_status", "home_control"] }
 # denied_tools_by_origin = { telegram = ["play_media"], "*" = [] }
+# Per-tool sliding-window rate limits (calls/minute). "*" is a catch-all; tools
+# without an entry are unlimited. A fast loop bounces off the limit after N calls.
+# max_actions_per_minute_by_tool = { play_media = 10, web_search = 20 }
+# Sensitive tools that must be requested twice with the same arguments within
+# confirmation_ttl_secs before they run. The first call returns a pending
+# response with a stable token; the confirming call passes confirmed = true.
+# requires_confirmation_tools = ["play_media"]
+# confirmation_ttl_secs = 120
 
 # Final actuation safety gate for physical home-control execution:
 # [core.actuation_safety]
@@ -180,6 +213,19 @@ wakeword_script = ""              # Empty = push-to-talk (alpha.5 default).
 # allowed_origins = ["voice", "dashboard", "api", "telegram", "repl", "confirmation"]
 # max_actions_per_minute = 12
 # max_actions_per_minute_by_origin = { telegram = 3, voice = 8 }
+
+# Trusted resolution of the request origin (issue #232). The per-origin tool/
+# actuation ACLs, rate limits, audit trail, and confidence thresholds above all
+# key off the X-Genie-Origin header, which is client-supplied and therefore
+# forgeable. genie-core only honors a privileged origin (anything but the `api`
+# baseline) from a loopback peer (the single-host trust boundary) or when the
+# request presents a matching token in the X-Genie-Origin-Token header. No setup
+# is needed for a localhost-only deployment; configure tokens when binding to a
+# LAN address behind a gateway, or set require_token to also stop one local
+# process from impersonating another's channel.
+# [core.origin_auth]
+# require_token = false                         # true => tokens mandatory even on loopback
+# tokens = { dashboard = "", telegram = "" }    # Prefer GENIE_ORIGIN_TOKEN_<ORIGIN> env vars.
 
 [governor]
 poll_interval_ms = 5000
@@ -197,6 +243,40 @@ zram_mb = 100                # Enable 2 GB zram swap (last resort).
 interval_secs = 30
 alert_enabled = false
 alert_webhook_url = ""            # Optional local notifier endpoint.
+
+# Inbound HTTP-server hardening, shared by genie-core (:3000) and genie-api
+# (:3080). Bounds the hand-rolled request reader so a single unauthenticated
+# peer on the LAN cannot exhaust memory (an endless header), stall the listener
+# with half-open connections, or fd-exhaust the daemon (issue #195). Defaults
+# are safe; tune only if a first-party client legitimately needs larger headers
+# or more concurrency.
+[http]
+max_request_line_bytes = 8192    # Reject request lines longer than this (431).
+max_header_line_bytes = 8192     # Reject any single header line longer than this (431).
+max_header_count = 100           # Reject more than this many header lines (431).
+max_header_bytes = 65536         # Reject when total header bytes exceed this (431).
+read_timeout_secs = 15           # Drop a connection that stalls mid-request.
+max_connections = 256            # Ceiling on concurrently handled connections.
+
+# Cross-origin / DNS-rebinding gate (issue #228). Both servers reflect only
+# allowlisted Origins (never a wildcard) and reject non-allowlisted Host
+# headers. Loopback (127.0.0.1 / localhost / [::1]) for each bound port is
+# always allowed, so the on-device UIs and the genie-api->genie-core proxy work
+# out of the box. To reach the daemon over the LAN by hostname/IP, list the
+# Host and Origin the browser uses here (this is what closes the DNS-rebinding
+# hole — do not bind 0.0.0.0 without setting these):
+#   allowed_hosts   = ["genie.local:3000", "192.168.1.50:3000"]
+#   allowed_origins = ["http://genie.local:3000", "http://192.168.1.50:3000"]
+allowed_hosts = []
+allowed_origins = []
+
+# Shared local API token for mutating/actuating endpoints (chat, memory edits,
+# actuation confirm). When set, both servers require it via `X-Genie-Token` or
+# `Authorization: Bearer <token>`; the on-device UIs receive it automatically
+# and genie-api forwards it to genie-core. Leave blank to rely on the
+# Origin/Host gate alone. Can also be set via GENIEPOD_LOCAL_API_TOKEN.
+# Generate one with e.g. `openssl rand -hex 32`.
+local_api_token = ""
 
 # Uncomment to enable Telegram long-poll chat integration:
 # [telegram]

@@ -18,6 +18,7 @@ Runtime load path:
 | Section | Purpose |
 | --- | --- |
 | `data_dir` | Root directory for runtime databases and profile data |
+| `[optional_ai_provider]` | Disabled-by-default API provider planning, including API-key or OAuth bearer auth mode |
 | `[core]` | `genie-core` runtime behavior |
 | `[governor]` | governor polling and day/night behavior |
 | `[governor.pressure]` | memory-pressure thresholds |
@@ -27,6 +28,44 @@ Runtime load path:
 | `[web_search]` | public web search tool behavior |
 | `[connectivity]` | coprocessor boundary enablement |
 | `[connectivity.esp32c6_uart]` | UART transport settings for ESP32-C6 |
+
+## `[optional_ai_provider]`
+
+This path is disabled by default. It exists for better testing, development
+portability, and transitional validation while preserving the local Jetson
+`genie-ai-runtime` default. Remote or alternate OpenAI-compatible providers are
+not the product runtime and must not become a shortcut around the small-context
+home harness.
+
+| Key | Purpose |
+| --- | --- |
+| `enabled` | Turn optional provider planning on |
+| `provider` | `open_ai_compatible`, `open_ai`, `anthropic`, `gemini`, or `custom` |
+| `auth_mode` | `api_key` for provider keys or `oauth_bearer` for OAuth access tokens |
+| `base_url` | Provider endpoint, for example `https://api.openai.com/v1` |
+| `api_key_env` | Env var that stores an API key when `auth_mode = "api_key"` |
+| `oauth_token_env` | Env var that stores an OAuth access token when `auth_mode = "oauth_bearer"` |
+| `context_window_tokens` | Provider context budget, which must fit the agent budget |
+| `allow_remote_base_url` | Required opt-in for non-loopback provider URLs |
+
+OAuth bearer mode never stores the token in TOML. For an OpenAI OAuth-token
+development/test deployment, use a secret env var and point config at it:
+
+```toml
+[optional_ai_provider]
+enabled = true
+provider = "open_ai"
+auth_mode = "oauth_bearer"
+base_url = "https://api.openai.com/v1"
+oauth_token_env = "OPENAI_OAUTH_ACCESS_TOKEN"
+context_window_tokens = 4096
+allow_remote_base_url = true
+```
+
+Do not enable this path for household production by default. If a provider is
+used for validation, keep `context_window_tokens` at or below
+`[agent].context_window_tokens` and avoid sending household memory unless the
+operator has explicitly accepted that privacy tradeoff.
 
 ## `[core]`
 
@@ -45,6 +84,9 @@ Runtime load path:
 | `piper_pipe_mode` | Keep Piper hot for lower latency |
 | `voice_tts_models` | Optional per-language Piper voices |
 | `max_history_turns` | Max conversation history included per turn |
+| `llm_connect_timeout_secs` | Max wait to open the LLM backend TCP connection (default `10`) |
+| `llm_read_timeout_secs` | Max idle seconds between LLM tokens/bytes before a read is abandoned; bounds every backend read so a hung read can't wedge chat (default `60`) |
+| `llm_request_timeout_secs` | Max seconds for a non-streaming completion's response body (default `120`) |
 | `expected_runtime_contract_hash` | Optional pinned contract hash for runtime drift detection |
 | `audio_device` | ALSA device or `"auto"` |
 | `audio_sample_rate` | Capture sample rate |
@@ -58,6 +100,7 @@ Runtime load path:
 | `skill_policy.*` | Runtime load policy for native skills |
 | `tool_policy.*` | Runtime allow/deny policy for model-callable tools by origin |
 | `actuation_safety.*` | Final home-actuation safety gate settings |
+| `origin_auth.*` | How a request may assume a privileged origin over HTTP |
 
 ### `[core.speaker_identity]`
 
@@ -136,6 +179,27 @@ Behavior notes:
 - `unknown` is not in the default `allowed_origins`; direct tool execution without a channel context cannot actuate the home.
 - Valid origin keys are `voice`, `dashboard`, `api`, `telegram`, `repl`, and `confirmation`.
 - Rate limits apply before physical execution and are tracked per origin over a 60-second window.
+- The origin these policies key off is resolved per `[core.origin_auth]` below, not taken at face value from the header.
+
+### `[core.origin_auth]`
+
+The `X-Genie-Origin` header is client-supplied, so it cannot by itself be a
+trusted security principal for the policies above (issue #232). A request may
+assume an origin more privileged than the `api` baseline only when it proves
+entitlement — by originating from a loopback peer or by presenting a matching
+token. Otherwise it is downgraded to `api`.
+
+| Key | Purpose |
+| --- | --- |
+| `require_token` | Require a valid token even from loopback peers (default `false`) |
+| `tokens` | Map of origin name to the shared secret expected in `X-Genie-Origin-Token` |
+
+Behavior notes:
+
+- Default (`require_token = false`, no tokens): loopback peers are trusted to set any origin; non-loopback peers cannot assume a privileged origin at all.
+- A configured token makes that origin require the token everywhere, including loopback — so one local process cannot impersonate another's channel.
+- Each token may instead be supplied via the `GENIE_ORIGIN_TOKEN_<ORIGIN>` environment variable (preferred; keep config files `0600`).
+- The in-process Telegram adapter automatically presents its configured token.
 
 ### Runtime Contract Pinning
 
@@ -199,8 +263,21 @@ Each service block has:
 
 | Key | Purpose |
 | --- | --- |
-| `url` | Health or base URL |
+| `url` | Health or base URL (`http://` or `https://`) |
 | `systemd_unit` | Associated systemd unit name |
+
+### HTTPS probe trust (status / health / dashboard latency)
+
+`genie-ctl status`, `genie-health`, and the dashboard latency rows probe
+configured `https://` service URLs using the shared helper in
+`genie-common::probe`.
+
+| Behavior | Detail |
+| --- | --- |
+| **Trust roots** | Mozilla CA bundle from the `webpki-roots` crate — **not** the host OS trust store |
+| **Self-signed LAN certs** | Rejected (common for local Home Assistant HTTPS). Use `http://` on the LAN, terminate TLS at a reverse proxy with a public CA, or wait for a future opt-in `tls_ca_file` / pin policy |
+| **Keep-alive responses** | Probes parse the status line (and `Content-Length` / chunked body when present) and return without waiting for EOF, so healthy keep-alive servers do not time out |
+| **Listen addresses** | `[services.api].url` / `api_http_addr` still require `http://` — HTTPS is probe-only, not a listen scheme |
 
 ## `[telegram]`
 
@@ -256,7 +333,7 @@ Behavior notes:
 | `response_timeout_ms` | UART response timeout |
 
 Legacy alias support exists for `esp32c6_spi`, but the current boundary is
-UART-oriented and the detailed SPI hosted work belongs in `genie-os`.
+UART-oriented and the detailed SPI hosted work belongs in the platform/OS layer.
 
 ## Environment Overrides And Related Runtime Variables
 
@@ -273,7 +350,7 @@ Operational variables used by systemd/deploy surfaces outside the Rust config:
 
 | Variable | Purpose |
 | --- | --- |
-| `GENIEPOD_LLM_MODEL` | Model path used by `genie-llm.service` / `llama-server` |
+| `GENIEPOD_LLM_MODEL` | Model path used by the active local LLM unit (`genie-ai-runtime.service` by default, or `genie-llm.service` for llama.cpp fallback) |
 
 ## Config Resolution Rules
 

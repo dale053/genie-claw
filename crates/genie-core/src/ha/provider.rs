@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use super::client::{Entity, HaClient};
+use super::entity_fidelity::{self, DomainArea};
 
 const AREA_TEMPLATE: &str = r#"
 {% set ns = namespace(items=[]) %}
@@ -327,12 +328,16 @@ impl HomeAssistantProvider {
         }
     }
 
-    fn resolve_target_in_graph(
+    pub(crate) fn resolve_target_in_graph(
         graph: &HomeGraph,
         query: &str,
         action_hint: Option<HomeActionKind>,
     ) -> Option<HomeTarget> {
         let query_lower = normalize(query);
+
+        if let Some(target) = Self::resolve_exact_entity_id(graph, query, action_hint) {
+            return Some(target);
+        }
 
         let area_match = best_area_match(&graph.areas, &query_lower);
         let domain_match = infer_domain(&query_lower);
@@ -363,6 +368,75 @@ impl HomeAssistantProvider {
         Self::resolve_named_entity(graph, query, action_hint)
     }
 
+    fn query_rejects_whole_home_fidelity(graph: &HomeGraph, query: &str) -> bool {
+        let query_lower = normalize(query);
+        let area_match = best_area_match(&graph.areas, &query_lower);
+        let domain_match = infer_domain(&query_lower);
+        if area_match.is_some() || domain_match.is_none() {
+            return false;
+        }
+        let entity_views: Vec<DomainArea<'_>> = graph
+            .entities
+            .iter()
+            .map(|entity| DomainArea {
+                domain: entity.domain.as_str(),
+                area: entity.area.as_deref(),
+            })
+            .collect();
+        !entity_fidelity::whole_home_resolution_is_trustworthy(&entity_views, query)
+    }
+
+    fn resolve_exact_entity_id(
+        graph: &HomeGraph,
+        query: &str,
+        action_hint: Option<HomeActionKind>,
+    ) -> Option<HomeTarget> {
+        let query = query.trim();
+        let entity = graph
+            .entities
+            .iter()
+            .find(|entity| entity.entity_id.eq_ignore_ascii_case(query))?;
+
+        match entity.domain.as_str() {
+            "scene" if !matches!(action_hint, Some(HomeActionKind::Activate) | None) => None,
+            "script" if !matches!(action_hint, Some(HomeActionKind::Activate) | None) => None,
+            "scene" => Some(HomeTarget {
+                kind: HomeTargetKind::Scene,
+                query: query.to_string(),
+                display_name: entity.name.clone(),
+                entity_ids: vec![entity.entity_id.clone()],
+                domain: Some(entity.domain.clone()),
+                area: entity.area.clone(),
+                confidence: 1.0,
+                voice_safe: true,
+            }),
+            "script" => graph
+                .scripts
+                .iter()
+                .find(|script| script.entity_id.eq_ignore_ascii_case(query))
+                .map(|script| HomeTarget {
+                    kind: HomeTargetKind::Script,
+                    query: query.to_string(),
+                    display_name: script.name.clone(),
+                    entity_ids: vec![script.entity_id.clone()],
+                    domain: Some("script".into()),
+                    area: script.area.clone(),
+                    confidence: 1.0,
+                    voice_safe: script.voice_safe,
+                }),
+            _ => Some(HomeTarget {
+                kind: HomeTargetKind::Entity,
+                query: query.to_string(),
+                display_name: entity.name.clone(),
+                entity_ids: vec![entity.entity_id.clone()],
+                domain: Some(entity.domain.clone()),
+                area: entity.area.clone(),
+                confidence: 1.0,
+                voice_safe: entity.domain != "lock",
+            }),
+        }
+    }
+
     fn resolve_domain_target(graph: &HomeGraph, query: &str, domain: &str) -> Option<HomeTarget> {
         let entity_ids: Vec<String> = graph
             .entities
@@ -372,6 +446,18 @@ impl HomeAssistantProvider {
             .collect();
 
         if entity_ids.is_empty() {
+            return None;
+        }
+
+        let entity_views: Vec<DomainArea<'_>> = graph
+            .entities
+            .iter()
+            .map(|entity| DomainArea {
+                domain: entity.domain.as_str(),
+                area: entity.area.as_deref(),
+            })
+            .collect();
+        if !entity_fidelity::whole_home_resolution_is_trustworthy(&entity_views, query) {
             return None;
         }
 
@@ -580,6 +666,10 @@ impl HomeAutomationProvider for HomeAssistantProvider {
             }
         }
 
+        if Self::query_rejects_whole_home_fidelity(&graph, query) {
+            anyhow::bail!("I couldn't find '{}' in this home", query);
+        }
+
         anyhow::bail!("no Home Assistant target matched '{}'", query)
     }
 
@@ -631,7 +721,13 @@ impl HomeAutomationProvider for HomeAssistantProvider {
             ),
             HomeActionKind::SetBrightness => {
                 ensure_domain(&domain, &["light"])?;
-                let brightness = normalize_brightness(action.value.unwrap_or(50.0));
+                // No silent default: a value-less set_brightness is rejected at
+                // the dispatch boundary (issue #421); error here too as defense
+                // in depth rather than actuating an arbitrary brightness.
+                let brightness =
+                    normalize_brightness(action.value.ok_or_else(|| {
+                        anyhow::anyhow!("set_brightness requires a numeric 'value'")
+                    })?);
                 (
                     "light".into(),
                     "turn_on",
@@ -640,7 +736,12 @@ impl HomeAutomationProvider for HomeAssistantProvider {
             }
             HomeActionKind::SetTemperature => {
                 ensure_domain(&domain, &["climate"])?;
-                let temp = action.value.unwrap_or(20.0);
+                // No silent default: a value-less set_temperature is rejected at
+                // the dispatch boundary (issue #421); error here too as defense
+                // in depth rather than actuating an arbitrary temperature.
+                let temp = action
+                    .value
+                    .ok_or_else(|| anyhow::anyhow!("set_temperature requires a numeric 'value'"))?;
                 (
                     "climate".into(),
                     "set_temperature",
@@ -874,9 +975,10 @@ fn domain_synonyms(domain: &str) -> Vec<String> {
 
 fn infer_domain(query: &str) -> Option<String> {
     let query = normalize(query);
-    let checks: [(&str, &[&str]); 5] = [
+    let checks: [(&str, &[&str]); 6] = [
         ("light", &["light", "lights", "lamp", "lamps"]),
         ("switch", &["switch", "switches", "plug", "outlet"]),
+        ("fan", &["fan", "fans"]),
         (
             "climate",
             &[
@@ -1187,6 +1289,37 @@ mod tests {
         assert_eq!(target.kind, HomeTargetKind::Group);
         assert_eq!(target.display_name, "All lights");
         assert_eq!(target.domain.as_deref(), Some("light"));
+        assert_eq!(target.entity_ids, vec!["light.living_room_lamp"]);
+    }
+
+    #[test]
+    fn resolve_target_rejects_foreign_room_whole_home_fallback() {
+        let graph = sample_graph();
+        assert!(
+            HomeAssistantProvider::resolve_target_in_graph(&graph, "upstairs lights", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn query_rejects_whole_home_fidelity_for_foreign_room() {
+        let graph = sample_graph();
+        assert!(HomeAssistantProvider::query_rejects_whole_home_fidelity(
+            &graph,
+            "upstairs lights"
+        ));
+    }
+
+    #[test]
+    fn resolve_exact_entity_id_before_fuzzy_matching() {
+        let graph = sample_graph();
+        let target =
+            HomeAssistantProvider::resolve_target_in_graph(&graph, "light.living_room_lamp", None)
+                .unwrap();
+
+        assert_eq!(target.kind, HomeTargetKind::Entity);
+        assert_eq!(target.display_name, "Living Room Lamp");
+        assert_eq!(target.confidence, 1.0);
         assert_eq!(target.entity_ids, vec!["light.living_room_lamp"]);
     }
 

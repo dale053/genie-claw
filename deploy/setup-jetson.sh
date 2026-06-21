@@ -4,11 +4,9 @@
 #   ssh geniepod@<jetson-ip> 'bash /opt/geniepod/setup-jetson.sh'
 #
 # Flags:
-#   --model phi-4-mini           Explicit form of today's default
-#                                (Phi-4-mini Q4_K_M).
-#   --model qwen3-4b             Download Qwen3-4B Q4_K_M instead
-#                                (issue #44). Recommended pairing with
-#                                genie-ai-runtime once both are installed.
+#   --model qwen3-4b             Explicit form of the current Jetson default
+#                                (Qwen3-4B Q4_K_M).
+#   --model phi-4-mini           Download the Phi-4-mini Q4_K_M fallback.
 #                                The flag only changes the download target;
 #                                it does NOT rewrite llm_model_path in
 #                                /etc/geniepod/geniepod.toml — flip that
@@ -30,17 +28,15 @@ CONFIG_DIR="/etc/geniepod"
 MODEL_DIR="$GENIEPOD_DIR/models"
 DATA_DIR="$GENIEPOD_DIR/data"
 
-# Phi-4-mini Q4_K_M — the current default. Pinned to lmstudio-community's
-# GGUF mirror because that conversion has been verified end-to-end on this
-# repo's Tegra/aarch64 + llama.cpp + flash-attn stack.
+# Phi-4-mini Q4_K_M — legacy fallback. Pinned to lmstudio-community's GGUF
+# mirror because that conversion has been verified end-to-end on this repo's
+# Tegra/aarch64 + llama.cpp + flash-attn stack.
 PHI_MODEL_FILENAME="phi-4-mini-instruct-q4_k_m.gguf"
 PHI_MODEL_URL="https://huggingface.co/lmstudio-community/Phi-4-mini-instruct-GGUF/resolve/main/Phi-4-mini-instruct-Q4_K_M.gguf"
 PHI_MODEL_LABEL="Phi-4-mini Q4_K_M (~2.4 GB)"
 
-# Qwen3-4B Q4_K_M — opt-in alternative (issue #44). Sourced from upstream
-# Qwen GGUF release. Stronger reasoning / multilingual / JSON tool-call
-# behavior than Phi-4-mini; per-token decode is slower, which is what
-# genie-ai-runtime is meant to address downstream.
+# Qwen3-4B Q4_K_M — current Jetson default. Sourced from upstream Qwen GGUF
+# release and paired with genie-ai-runtime.
 QWEN3_MODEL_FILENAME="Qwen3-4B-Q4_K_M.gguf"
 QWEN3_MODEL_URL="https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf"
 QWEN3_MODEL_LABEL="Qwen3-4B Q4_K_M (~2.5 GB)"
@@ -305,8 +301,8 @@ fi
 # 4. Ensure the configured LLM model exists.
 # Selection rules (issue #44):
 #   - Without --model: honor llm_model_path in geniepod.toml if set, else
-#     fall back to the Phi-4-mini default path. Auto-download only when
-#     the resolved path matches the default for the active model choice.
+#     fall back to the Qwen3 default path. Auto-download only when the resolved
+#     path matches the default for the active model choice.
 #   - With --model <name>: download <name>'s canonical artifact to
 #     $MODEL_DIR/<filename>. Does NOT rewrite llm_model_path — operator
 #     flips that line by hand to switch the running LLM.
@@ -358,7 +354,7 @@ if [ -n "$MODEL_CHOICE" ] && [ "$MODEL_CHOICE" != "qwen3-4b" ]; then
         echo "          llm_model_path = \"$GGUF\""
         echo "          llm_model_name = \"phi\"    # selects the Phi prompt template"
         echo "        update GENIEPOD_LLM_MODEL in the active LLM systemd unit"
-        echo "        (genie-ai-runtime.service for the alpha.9 default, or"
+        echo "        (genie-ai-runtime.service for the Jetson default, or"
         echo "        genie-llm.service for the llama.cpp fallback), then:"
         echo "          sudo systemctl restart <active-llm-unit> genie-core"
     fi
@@ -571,7 +567,7 @@ else
     VOICE_MISSING=1
 fi
 
-# alpha.5: record_audio peak-normalizes captures with `sox gain -n` so
+# record_audio peak-normalizes captures with `sox gain -n` so
 # weak mic signals reach whisper at nominal level. Not strictly required
 # (genie-core falls back to raw recording with a warning), but strongly
 # recommended for accuracy.
@@ -582,7 +578,7 @@ else
     echo "             (genie-core falls back to raw audio, but STT accuracy suffers on quiet captures)"
 fi
 
-# alpha.5: whisper-server is preferred for STT (long-running, model stays in
+# whisper-server is preferred for STT (long-running, model stays in
 # GPU memory). Optional in dev hosts where whisper_port = 0 forces CLI mode.
 WHISPER_SERVER="$GENIEPOD_DIR/bin/whisper-server"
 WHISPER_PORT="$(read_toml_string whisper_port)"
@@ -636,7 +632,7 @@ if [ "$VOICE_MISSING" -eq 1 ]; then
     echo "  Until installed, keep voice_enabled = false in $CONFIG_DIR/geniepod.toml."
 fi
 
-# 5f. Install DeepFilterNet `deep-filter` binary (alpha.7, issue #12).
+# 5f. Install DeepFilterNet `deep-filter` binary.
 # Used by record_audio when audio_denoiser = "deepfilternet". The binary is
 # self-contained — DFN3 model is statically linked via tract. License: MIT/
 # Apache-2.0 dual (the project explicitly clarifies AGPL compatibility).

@@ -1,8 +1,8 @@
 //! # genie-core
 //!
-//! Core runtime for GeniePod Home.
+//! Core runtime for the NVIDIA Jetson Orin 8GB-native home agent.
 //!
-//! Built for the GeniePod Home appliance, but exposed as modular Rust components.
+//! Built for the NVIDIA Jetson Orin 8GB appliance path, but exposed as modular Rust components.
 //! Any Rust project can use these modules independently:
 //!
 //! ```rust,no_run
@@ -17,9 +17,10 @@
 //! | Module | What it does |
 //! |--------|-------------|
 //! | [`agent_harness`] | Limited-context prompt/tool/memory/provider contract checks |
-//! | [`llm`] | OpenAI-compatible local LLM client (llama.cpp, Ollama, any API) |
+//! | [`llm`] | OpenAI-compatible LLM facade (`genie-ai-runtime`, llama.cpp, optional providers) |
 //! | [`ha`] | Home Assistant provider boundary, structure cache, and REST client |
 //! | [`tools`] | Compiled tool dispatch + parser for LLM JSON output |
+//! | [`eval`] | BFCL-style side-effect-free tool-call scoring |
 //! | [`memory`] | SQLite + FTS5 persistent memory with confidence decay |
 //! | [`conversation`] | Multi-session persistent conversation store |
 //! | [`connectivity`] | Boundary for an ESP32-C6 UART Thread/Matter coprocessor |
@@ -33,7 +34,7 @@
 //! ## Design principles
 //!
 //! - **No HTTP framework** — raw tokio TcpListener (keeps binary small)
-//! - **No AI framework** — direct OpenAI API over TCP (no langchain, no autogen)
+//! - **No AI framework** — direct OpenAI-compatible HTTP clients (no langchain, no autogen)
 //! - **Bundled SQLite** — no external database dependency
 //! - **Single-threaded** — `tokio::main(flavor = "current_thread")`
 //! - **AGPL-3.0-only** — network-facing modifications must stay available to users
@@ -46,12 +47,15 @@ pub mod agent_harness;
 pub mod connectivity;
 pub mod context;
 pub mod conversation;
+pub mod eval;
 pub mod ha;
 pub mod llm;
 pub mod memory;
+pub mod origin_auth;
 pub mod ota;
 pub mod profile;
 pub mod prompt;
+pub mod prompt_sha;
 pub mod reasoning;
 pub mod repl;
 pub mod runtime_boundary;
@@ -76,6 +80,6 @@ pub use connectivity::{
 pub use conversation::ConversationStore;
 pub use ha::{HaClient, HomeAssistantProvider, HomeAutomationProvider};
 pub use llm::{LlmClient, Message};
-pub use memory::Memory;
+pub use memory::{Memory, SharedMemory};
 pub use prompt::PromptBuilder;
-pub use tools::{ToolCall, ToolDispatcher, ToolResult};
+pub use tools::{ToolActionClass, ToolCall, ToolDispatcher, ToolResult};
