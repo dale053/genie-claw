@@ -2683,6 +2683,17 @@ enabled = true
 base_url = "http://127.0.0.1:8180/v1"
 trigger = "local_decline"
 vocab_path = "/vocab/seed"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.enabled);
+        assert_eq!(config.trigger, EscalationTrigger::LocalDecline);
+        assert_eq!(config.vocab_path, "/vocab/seed");
+        assert!(config.endpoint_is_valid());
+    }
+
+    #[test]
     fn http_server_config_defaults_are_bounded() {
         let config = test_config();
         assert_eq!(config.http.max_request_line_bytes, 8 * 1024);
@@ -2710,10 +2721,12 @@ systemd_unit = "genie-ai-runtime.service"
         )
         .unwrap();
 
-        assert!(config.enabled);
-        assert_eq!(config.trigger, EscalationTrigger::LocalDecline);
-        assert_eq!(config.vocab_path, "/vocab/seed");
-        assert!(config.endpoint_is_valid());
+        assert_eq!(config.http.max_request_line_bytes, 8 * 1024);
+        assert_eq!(config.http.max_header_line_bytes, 8 * 1024);
+        assert_eq!(config.http.max_header_count, 100);
+        assert_eq!(config.http.max_header_bytes, 64 * 1024);
+        assert_eq!(config.http.read_timeout_secs, 15);
+        assert_eq!(config.http.max_connections, 256);
     }
 
     #[test]
@@ -2722,8 +2735,11 @@ systemd_unit = "genie-ai-runtime.service"
             r#"
 enabled = true
 base_url = "http://proxy.example.com/v1"
-        assert_eq!(config.http.max_header_bytes, 64 * 1024);
-        assert_eq!(config.http.max_connections, 256);
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.endpoint_is_valid());
     }
 
     #[test]
@@ -2740,7 +2756,12 @@ max_connections = 16
         )
         .unwrap();
 
-        assert!(!config.endpoint_is_valid());
+        assert_eq!(config.max_request_line_bytes, 2048);
+        assert_eq!(config.max_header_line_bytes, 2048);
+        assert_eq!(config.max_header_count, 32);
+        assert_eq!(config.max_header_bytes, 16384);
+        assert_eq!(config.read_timeout_secs, 5);
+        assert_eq!(config.max_connections, 16);
     }
 
     #[test]
@@ -2787,12 +2808,6 @@ max_connections = 16
         let flags = summary["risk_flags"].to_string();
 
         assert!(flags.contains("privacy_proxy_endpoint_not_localhost"));
-        assert_eq!(config.max_request_line_bytes, 2048);
-        assert_eq!(config.max_header_line_bytes, 2048);
-        assert_eq!(config.max_header_count, 32);
-        assert_eq!(config.max_header_bytes, 16384);
-        assert_eq!(config.read_timeout_secs, 5);
-        assert_eq!(config.max_connections, 16);
     }
 
     #[test]

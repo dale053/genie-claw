@@ -13,9 +13,8 @@ use genie_common::config::{LlmBackendKind, ServiceEndpoint};
 pub use genie_ai_runtime::GenieAiRuntimeBackend;
 pub use llama_cpp::LlamaCppBackend;
 pub use mock::MockLlmBackend;
-pub use openai_compat::{Message, ResponseFormat};
-pub use privacy_proxy::PrivacyProxyBackend;
 pub use openai_compat::{LlmTimeouts, Message, ResponseFormat};
+pub use privacy_proxy::PrivacyProxyBackend;
 pub use openai_compatible::OpenAiCompatibleBackend;
 pub use provider::{OptionalProviderPlan, ProviderReadiness};
 
@@ -359,6 +358,9 @@ mod tests {
             "/vocab/seed",
         );
         assert_eq!(client.backend_name(), "privacy-proxy");
+    }
+
+    #[test]
     fn can_construct_openai_compatible_bearer_client() {
         let client = LlmClient::from_openai_compatible_url_with_bearer_token(
             "http://127.0.0.1:8080/v1",
