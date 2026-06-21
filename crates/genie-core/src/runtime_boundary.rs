@@ -1,8 +1,9 @@
 //! Runtime boundary contracts for the GenieClaw agent layer.
 //!
-//! GenieClaw owns agent policy, prompt assembly, memory, tools, channels, and
-//! audit. It consumes lower runtime contracts for inference, voice I/O, and
-//! physical home control; it should not grow into those runtimes.
+//! GenieClaw owns agent policy, prompt assembly, family memory, tools,
+//! channels, and audit for a low-latency private home agent. It consumes lower
+//! runtime contracts for inference, voice I/O, and physical home control; it
+//! should not grow into those runtimes.
 
 use genie_common::config::{
     AgentConfig, AgentRuntimeProfile, OptionalAiProviderConfig, RuntimeBoundaryMode,
@@ -42,12 +43,12 @@ pub fn runtime_boundaries(agent: &AgentConfig) -> Vec<RuntimeBoundaryContract> {
             layer: "ai_runtime",
             owner: "genie-ai-runtime",
             mode: format!("{:?}", agent.ai_runtime_boundary),
-            contract: "OpenAI-compatible chat plus limited-context compaction, conversation_id, and nvext.agent_hints",
+            contract: "OpenAI-compatible chat plus limited-context compaction, conversation_id, nvext.agent_hints, and system-prompt prefix cache hints",
             local_default: true,
         },
         RuntimeBoundaryContract {
             layer: "voice_runtime",
-            owner: "genie-voice-runtime",
+            owner: "external_voice_boundary",
             mode: format!("{:?}", agent.voice_runtime_boundary),
             contract: "transcript-in and speak-out session protocol",
             local_default: matches!(
@@ -57,7 +58,7 @@ pub fn runtime_boundaries(agent: &AgentConfig) -> Vec<RuntimeBoundaryContract> {
         },
         RuntimeBoundaryContract {
             layer: "home_runtime",
-            owner: "genie-home-runtime",
+            owner: "external_home_boundary",
             mode: format!("{:?}", agent.home_runtime_boundary),
             contract: "intent handoff plus final physical actuation gate",
             local_default: matches!(
@@ -93,7 +94,7 @@ pub fn is_jetson_baseline(agent: &AgentConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genie_common::config::OptionalAiProviderKind;
+    use genie_common::config::{OptionalAiProviderAuthMode, OptionalAiProviderKind};
 
     #[test]
     fn default_agent_contract_is_jetson_limited_context() {
@@ -111,8 +112,8 @@ mod tests {
 
         assert_eq!(boundaries.len(), 3);
         assert_eq!(boundaries[0].owner, "genie-ai-runtime");
-        assert_eq!(boundaries[1].owner, "genie-voice-runtime");
-        assert_eq!(boundaries[2].owner, "genie-home-runtime");
+        assert_eq!(boundaries[1].owner, "external_voice_boundary");
+        assert_eq!(boundaries[2].owner, "external_home_boundary");
         assert!(boundaries.iter().all(|boundary| !boundary.layer.is_empty()));
     }
 
@@ -122,13 +123,15 @@ mod tests {
         let provider = OptionalAiProviderConfig {
             enabled: true,
             provider: OptionalAiProviderKind::OpenAi,
+            auth_mode: OptionalAiProviderAuthMode::ApiKey,
             base_url: "https://api.openai.com/v1".into(),
             api_key_env: "OPENAI_API_KEY".into(),
+            oauth_token_env: "OPENAI_OAUTH_ACCESS_TOKEN".into(),
             context_window_tokens: 8192,
             allow_remote_base_url: true,
         };
 
         assert!(!provider_respects_agent_context(&provider, &agent));
-        assert!(!provider.production_candidate(&agent));
+        assert!(!provider.transitional_test_candidate(&agent));
     }
 }

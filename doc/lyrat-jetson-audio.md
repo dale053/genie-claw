@@ -202,13 +202,13 @@ Rate` to 48 kHz produces 2× chipmunk playback; 24 kHz produces natural
 pitch). Reason unknown — likely an APLL/MCLK divider constraint or
 slot-width fallback inside the ESP32 I2S clock generator.
 
-For alpha.5 the workaround is: tell the Jetson AHUB to expect 24 kHz.
+The current workaround is: tell the Jetson AHUB to expect 24 kHz.
 `genie-audio-init` writes `I2S2 Sample Rate = 24000` for this reason.
 Capture-side parameters in `[core]` (e.g. `audio_sample_rate = 16000`)
 work fine — ALSA `plughw:APE,0` downsamples 24 kHz → 16 kHz cleanly.
 
 Investigating the ESP-IDF clock setup so the LyraT actually emits 48 kHz
-LRCK as configured is tracked as alpha.6 work.
+LRCK as configured remains future hardware/firmware work.
 
 ## Limitations / known gaps
 

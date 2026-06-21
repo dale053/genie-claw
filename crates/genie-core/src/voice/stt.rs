@@ -575,10 +575,9 @@ pub async fn flush_mic_buffer(device: &str, sample_rate: u32) {
 /// Variants in increasing strength / latency:
 /// - `None`        — bandpass + peak-normalize only (debug / no-denoise A/B)
 /// - `Sox`         — sox `noisered` spectral subtraction against a per-host
-///   noise profile (alpha.6 baseline, see PR #11)
+///   noise profile
 /// - `DeepFilterNet` — neural denoiser via the `deep-filter` subprocess
-///   (alpha.7, see issue #12). Handles non-stationary noise
-///   without a noise profile.
+///   Handles non-stationary noise without a noise profile.
 #[derive(Debug, Clone)]
 pub enum Denoiser {
     None,
@@ -699,9 +698,9 @@ pub async fn record_audio(
     //                    a hard compand gate.
     //   - Sox:           spectral subtraction with a per-host noise profile
     //                    captured by setup-jetson.sh, plus a compand gate +
-    //                    quiet-speech lift (alpha.6 baseline).
-    //   - None:          bandpass + compand + normalize only (alpha.6 fallback
-    //                    when no noise profile is available).
+    //                    quiet-speech lift.
+    //   - None:          bandpass + compand + normalize only when no noise
+    //                    profile is available.
     let normalized_path = preprocess_capture(&wav_path, &denoiser).await?;
     let _ = tokio::fs::copy(&normalized_path, "/tmp/geniepod-last-rec.wav").await;
     if normalized_path != wav_path {
@@ -734,8 +733,8 @@ async fn preprocess_capture(wav_path: &str, denoiser: &Denoiser) -> Result<Strin
     }
 }
 
-/// alpha.6 sox-only chain: downmix → bandpass → (optional noisered) → compand
-/// gate+lift → peak-normalize. Falls back to the raw WAV on sox failure.
+/// Sox-only chain: downmix → bandpass → (optional noisered) → compand gate+lift
+/// → peak-normalize. Falls back to the raw WAV on sox failure.
 async fn run_sox_chain(
     wav_path: &str,
     normalized_path: &str,
@@ -797,7 +796,7 @@ async fn run_sox_chain(
     }
 }
 
-/// alpha.7 DeepFilterNet chain:
+/// DeepFilterNet chain:
 ///   sox(channels 1, highpass 100, lowpass 7000) → mono_path
 ///   deep-filter mono_path -o tmp_dir → tmp_dir/<basename>
 ///   sox(gain -n -3) → normalized_path

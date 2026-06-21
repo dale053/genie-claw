@@ -1,11 +1,11 @@
 use genie_common::config::Config;
+use genie_common::jsonl::{self, DEFAULT_MAX_JSONL_LINE_BYTES};
+use genie_common::probe::{ProbeTimeouts, probe_configured_url};
 use genie_common::tegrastats;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::process::Command;
 
 use crate::http::Response;
@@ -41,6 +41,17 @@ pub async fn get_status(_config: &Config) -> Response {
         status: 200,
         content_type: "application/json",
         body,
+    }
+}
+
+/// Classify a SQLite error string and return an HTTP status code + error message.
+fn classify_sqlite_error(err: &str) -> (u16, String) {
+    let lower = err.to_lowercase();
+    let is_transient = lower.contains("database is locked") || lower.contains("database is busy");
+    if is_transient {
+        (503, "tegrastats data temporarily unavailable".into())
+    } else {
+        (500, "failed to read tegrastats data".into())
     }
 }
 
@@ -88,11 +99,30 @@ pub async fn get_tegrastats(config: &Config) -> Response {
             content_type: "application/json",
             body: json,
         },
-        _ => Response {
-            status: 200,
-            content_type: "application/json",
-            body: "[]".into(),
-        },
+        Ok(Err(e)) => {
+            let (status, error_msg) = classify_sqlite_error(&e);
+            tracing::error!(%e, "failed to read tegrastats from governor.db");
+            Response {
+                status,
+                content_type: "application/json",
+                body: serde_json::json!({
+                    "error": error_msg,
+                    "detail": e
+                })
+                .to_string(),
+            }
+        }
+        Err(e) => {
+            tracing::error!(%e, "tegrastats spawn_blocking panicked or was cancelled");
+            Response {
+                status: 500,
+                content_type: "application/json",
+                body: serde_json::json!({
+                    "error": "internal error reading tegrastats"
+                })
+                .to_string(),
+            }
+        }
     }
 }
 
@@ -434,51 +464,16 @@ async fn collect_live_latency_rows(
 
 async fn probe_http_latency(url: &str) -> LiveLatencyRow {
     let start = Instant::now();
-    let result = async {
-        let url = url.strip_prefix("http://").unwrap_or(url);
-        let (host_port, path) = url.split_once('/').unwrap_or((url, ""));
-        let path = format!("/{path}");
-
-        let mut stream =
-            tokio::time::timeout(Duration::from_millis(750), TcpStream::connect(host_port))
-                .await
-                .map_err(|_| "connect timeout".to_string())?
-                .map_err(|e| e.to_string())?;
-
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let mut buf = [0u8; 256];
-        let n = tokio::time::timeout(Duration::from_millis(750), stream.read(&mut buf))
-            .await
-            .map_err(|_| "read timeout".to_string())?
-            .map_err(|e| e.to_string())?;
-
-        let response = String::from_utf8_lossy(&buf[..n]);
-        let status = response
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse::<u16>().ok())
-            .unwrap_or(0);
-
-        if (200..400).contains(&status) {
-            Ok(())
-        } else if status > 0 {
-            Err(format!("HTTP {status}"))
-        } else {
-            Err("invalid HTTP response".into())
-        }
-    }
-    .await;
+    let timeouts = ProbeTimeouts {
+        connect: Duration::from_millis(750),
+        read: Duration::from_millis(750),
+    };
+    let result = probe_configured_url(url, timeouts).await;
 
     LiveLatencyRow {
         healthy: result.is_ok(),
         response_ms: start.elapsed().as_millis() as i64,
-        error: result.err(),
+        error: result.err().map(|e| e.to_string()),
     }
 }
 
@@ -607,12 +602,18 @@ async fn query_governor(json_cmd: &str) -> Option<serde_json::Value> {
     line.and_then(|l| serde_json::from_str(&l).ok())
 }
 
-/// GET / — serve the dashboard HTML.
-pub fn serve_dashboard() -> Response {
+/// Placeholder in the dashboard HTML, replaced at request time with the
+/// configured local API token so the same-origin dashboard can authenticate its
+/// mutating calls to genie-api (issue #228).
+const TOKEN_PLACEHOLDER: &str = "__GENIE_LOCAL_TOKEN__";
+
+/// GET / — serve the dashboard HTML with the local API token injected.
+pub fn serve_dashboard(local_api_token: &str) -> Response {
     Response {
         status: 200,
         content_type: "text/html; charset=utf-8",
-        body: include_str!("../../dashboard/index.html").into(),
+        body: include_str!("../../dashboard/index.html")
+            .replace(TOKEN_PLACEHOLDER, local_api_token),
     }
 }
 
@@ -678,15 +679,11 @@ pub async fn get_actuation_actions(config: &Config) -> Response {
 pub async fn get_actuation_audit(config: &Config) -> Response {
     let path = config.data_dir.join("safety/actuation-audit.jsonl");
     let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        if !path.exists() {
-            return Ok("[]".into());
-        }
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        let items = text
-            .lines()
-            .rev()
-            .take(50)
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        let lines = jsonl::tail_lines(&path, 50, DEFAULT_MAX_JSONL_LINE_BYTES)
+            .map_err(|e| e.to_string())?;
+        let items = lines
+            .into_iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
             .collect::<Vec<_>>();
         serde_json::to_string(&items).map_err(|e| e.to_string())
     })
@@ -848,26 +845,58 @@ pub async fn post_memory_reorder(config: &Config, body: Option<&str>) -> Respons
     }
 }
 
+const MAX_CORE_PROXY_RESPONSE_BYTES: usize = 1024 * 1024;
+const CORE_PROXY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn read_core_proxy_response(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = tokio::time::timeout(CORE_PROXY_READ_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| "core response read timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > MAX_CORE_PROXY_RESPONSE_BYTES {
+            return Err(format!(
+                "core response exceeds {} bytes",
+                MAX_CORE_PROXY_RESPONSE_BYTES
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
+}
+
 async fn proxy_core_json(
     config: &Config,
     method: &str,
     path: &str,
     body: Option<&str>,
 ) -> Result<CoreProxyResponse, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
     let addr = config.core_http_addr();
-    let host = addr
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(addr.as_str());
     let mut stream = TcpStream::connect(&addr)
         .await
         .map_err(|e| format!("{addr}: {e}"))?;
     let body_str = body.unwrap_or("");
+    // Send the full host:port as Host so it matches genie-core's allowlist, and
+    // forward the shared local token so genie-core's mutating-endpoint gate
+    // accepts the proxied request (issue #228).
+    let token = config.http.local_api_token.trim();
+    let token_header = if token.is_empty() {
+        String::new()
+    } else {
+        format!("X-Genie-Token: {token}\r\n")
+    };
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{token_header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         body_str.len(),
         body_str
     );
@@ -875,11 +904,7 @@ async fn proxy_core_json(
         .write_all(request.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .map_err(|e| e.to_string())?;
+    let raw = read_core_proxy_response(&mut stream).await?;
     let raw = String::from_utf8_lossy(&raw);
     let (head, body) = raw
         .split_once("\r\n\r\n")
@@ -918,6 +943,7 @@ mod tests {
             telegram: TelegramConfig::default(),
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
+            http: Default::default(),
         }
     }
 
@@ -1145,5 +1171,70 @@ mod tests {
         );
         assert_eq!(wakeword.source, "config");
         assert_eq!(wakeword.sub_state, "disabled");
+    }
+
+    #[tokio::test]
+    async fn read_core_proxy_response_rejects_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let max = MAX_CORE_PROXY_RESPONSE_BYTES;
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9999999\r\n\r\n")
+                .await;
+            let chunk = vec![b'x'; 8192];
+            loop {
+                let _ = stream.write_all(&chunk).await;
+            }
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await;
+        let error = read_core_proxy_response(&mut stream).await.unwrap_err();
+        server.abort();
+
+        assert!(
+            error.contains(&format!("core response exceeds {max} bytes")),
+            "expected size cap error, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tegrastats_returns_500_when_db_does_not_exist() {
+        let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
+        let mut config = test_config();
+        config.data_dir = tmp.path().to_path_buf();
+
+        let response = get_tegrastats(&config).await;
+
+        assert_eq!(response.status, 500);
+        assert!(response.body.contains("error"));
+        assert!(response.body.contains("failed to read tegrastats data"));
+    }
+
+    #[test]
+    fn classify_sqlite_error_transient() {
+        let (status, msg) = classify_sqlite_error("database is locked");
+        assert_eq!(status, 503);
+        assert_eq!(msg, "tegrastats data temporarily unavailable");
+
+        let (status, _) = classify_sqlite_error("Database is Busy");
+        assert_eq!(status, 503);
+    }
+
+    #[test]
+    fn classify_sqlite_error_permanent() {
+        let (status, msg) = classify_sqlite_error("unable to open database file");
+        assert_eq!(status, 500);
+        assert_eq!(msg, "failed to read tegrastats data");
     }
 }

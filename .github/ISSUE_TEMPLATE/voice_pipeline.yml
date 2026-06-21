@@ -85,7 +85,7 @@ body:
     id: llm_backend
     attributes:
       label: LLM backend + model
-      placeholder: "genie-ai-runtime / phi-4-mini-instruct-q4_k_m.gguf"
+      placeholder: "genie-ai-runtime / Qwen3-4B-Q4_K_M.gguf"
     validations:
       required: false
 
@@ -115,7 +115,7 @@ body:
     id: version
     attributes:
       label: GenieClaw version / commit
-      placeholder: "v1.0.0-alpha.9 or commit SHA"
+      placeholder: "v1.0.0-alpha.10 or commit SHA"
     validations:
       required: true
 

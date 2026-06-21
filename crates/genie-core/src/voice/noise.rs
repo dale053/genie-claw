@@ -177,24 +177,24 @@ fn apply_noise_suppression(samples: &mut [f32], strength: f32, sample_rate: u32)
         return; // Too short to estimate noise.
     }
 
-    // Estimate noise floor from the quietest 20% of frames.
-    let mut frame_energies: Vec<(usize, f32)> = (0..num_frames)
+    // Per-frame RMS, computed once and reused for both the noise-floor
+    // estimate and the suppression pass below (the loop used to recompute
+    // frame_rms for every frame — a second full pass over the samples).
+    let frame_rms_by_index: Vec<f32> = (0..num_frames)
         .map(|i| {
             let start = i * frame_size;
             let end = (start + frame_size).min(samples.len());
-            (i, frame_rms(&samples[start..end]))
+            frame_rms(&samples[start..end])
         })
         .collect();
 
-    frame_energies.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
     // Average RMS of quietest 20% = estimated noise floor.
+    let mut sorted_energies = frame_rms_by_index.clone();
+    sorted_energies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
     let noise_frame_count = (num_frames / 5).max(1);
-    let noise_floor: f32 = frame_energies[..noise_frame_count]
-        .iter()
-        .map(|(_, e)| e)
-        .sum::<f32>()
-        / noise_frame_count as f32;
+    let noise_floor: f32 =
+        sorted_energies[..noise_frame_count].iter().sum::<f32>() / noise_frame_count as f32;
 
     if noise_floor < 10.0 {
         return; // Very quiet — no noise to suppress.
@@ -203,10 +203,9 @@ fn apply_noise_suppression(samples: &mut [f32], strength: f32, sample_rate: u32)
     // Apply suppression: attenuate frames that are close to the noise floor.
     let suppression_threshold = noise_floor * 3.0; // Frames below 3× noise floor get suppressed.
 
-    for i in 0..num_frames {
+    for (i, &frame_rms) in frame_rms_by_index.iter().enumerate() {
         let start = i * frame_size;
         let end = (start + frame_size).min(samples.len());
-        let frame_rms = frame_rms(&samples[start..end]);
 
         if frame_rms < suppression_threshold {
             // This frame is mostly noise — attenuate.
@@ -351,5 +350,29 @@ mod tests {
             rms_before,
             rms_after
         );
+    }
+
+    #[test]
+    fn noise_suppression_ignores_too_short_input() {
+        // Fewer than 3 frames can't estimate a noise floor (and strength <= 0 is a
+        // no-op): the buffer comes back untouched despite carrying suppressible signal.
+        let original: Vec<f32> = (0..1500).map(|i| (i as f32 * 0.3).sin() * 3000.0).collect();
+        let mut samples = original.clone();
+        apply_noise_suppression(&mut samples, 0.6, 48000); // frame_size 960 -> 1 frame < 3
+        assert_eq!(samples, original);
+
+        let mut zero_strength = original.clone();
+        apply_noise_suppression(&mut zero_strength, 0.0, 48000);
+        assert_eq!(zero_strength, original);
+    }
+
+    #[test]
+    fn noise_suppression_ignores_near_silence() {
+        // A long but near-silent buffer (per-frame RMS ~3.5) sits below the 10.0
+        // noise-floor threshold, so suppression bails and leaves it unchanged.
+        let original: Vec<f32> = (0..9600).map(|i| (i as f32 * 0.3).sin() * 5.0).collect();
+        let mut samples = original.clone();
+        apply_noise_suppression(&mut samples, 0.6, 48000); // 10 frames, noise_floor ~3.5 < 10
+        assert_eq!(samples, original);
     }
 }

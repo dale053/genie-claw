@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 /// Top-level GeniePod system configuration.
 ///
@@ -40,6 +41,9 @@ pub struct Config {
 
     #[serde(default)]
     pub connectivity: ConnectivityConfig,
+
+    #[serde(default)]
+    pub http: HttpServerConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,7 +62,7 @@ pub struct CoreConfig {
     /// Home Assistant long-lived access token.
     /// Can also be set via HA_TOKEN env var.
     #[serde(default)]
-    pub ha_token: String,
+    pub ha_token: Zeroizing<String>,
 
     /// LLM model name (for prompt optimization). Auto-detected from filename.
     #[serde(default = "defaults::llm_model_name")]
@@ -83,6 +87,26 @@ pub struct CoreConfig {
     /// Max conversation history turns to keep.
     #[serde(default = "defaults::max_history_turns")]
     pub max_history_turns: usize,
+
+    /// Seconds to wait for the LLM backend TCP connection to establish before
+    /// giving up. Bounds the streaming `connect` that previously had no timeout
+    /// (issue #181).
+    #[serde(default = "defaults::llm_connect_timeout_secs")]
+    pub llm_connect_timeout_secs: u64,
+
+    /// Maximum idle seconds between bytes/tokens from the LLM backend before a
+    /// read is abandoned. This bounds every client read (streaming SSE lines and
+    /// HTTP headers) so a single hung backend read can no longer hold the chat
+    /// turn lock forever and wedge all chat (issue #181). Generous by default so
+    /// a cold model swap's first-token latency is not mistaken for a hang.
+    #[serde(default = "defaults::llm_read_timeout_secs")]
+    pub llm_read_timeout_secs: u64,
+
+    /// Maximum seconds for a non-streaming LLM completion (the single response
+    /// body read, which spans the whole generation). Backstops the idle read
+    /// timeout for the blocking `/v1/chat/completions` path (issue #181).
+    #[serde(default = "defaults::llm_request_timeout_secs")]
+    pub llm_request_timeout_secs: u64,
 
     /// Optional pinned runtime contract hash for drift detection.
     #[serde(default)]
@@ -191,6 +215,10 @@ pub struct CoreConfig {
     /// Final actuation safety gate for home-control execution.
     #[serde(default)]
     pub actuation_safety: ActuationSafetyConfig,
+
+    /// Authentication for assuming a privileged request origin over HTTP.
+    #[serde(default)]
+    pub origin_auth: OriginAuthConfig,
 }
 
 impl Default for CoreConfig {
@@ -198,13 +226,16 @@ impl Default for CoreConfig {
         Self {
             port: defaults::core_port(),
             bind_host: defaults::core_bind_host(),
-            ha_token: String::new(),
+            ha_token: Zeroizing::new(String::new()),
             llm_model_name: defaults::llm_model_name(),
             whisper_model: defaults::whisper_model(),
             whisper_port: 0,
             piper_model: defaults::piper_model(),
             piper_pipe_mode: defaults::piper_pipe_mode(),
             max_history_turns: defaults::max_history_turns(),
+            llm_connect_timeout_secs: defaults::llm_connect_timeout_secs(),
+            llm_read_timeout_secs: defaults::llm_read_timeout_secs(),
+            llm_request_timeout_secs: defaults::llm_request_timeout_secs(),
             expected_runtime_contract_hash: String::new(),
             whisper_cli_path: defaults::whisper_cli_path(),
             piper_path: defaults::piper_path(),
@@ -227,19 +258,22 @@ impl Default for CoreConfig {
             skill_policy: SkillPolicyConfig::default(),
             tool_policy: ToolPolicyConfig::default(),
             actuation_safety: ActuationSafetyConfig::default(),
+            origin_auth: OriginAuthConfig::default(),
         }
     }
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
-    /// Primary deployment profile. Jetson stays the flagship default, but the
-    /// agent contract must also run on portable dev hosts and SBCs.
+    /// Primary deployment profile. Jetson stays the flagship default, while
+    /// Raspberry Pi and generic portable SBCs remain maintained headless agent
+    /// profiles.
     #[serde(default)]
     pub runtime_profile: AgentRuntimeProfile,
 
-    /// Non-negotiable context budget for the Jetson baseline. Stronger models
-    /// may adapt upward later, but production paths must pass this budget first.
+    /// Non-negotiable context budget for the Jetson baseline. Low latency and
+    /// accuracy should come from high-signal home context, family memory, and
+    /// typed tools before any path adapts upward.
     #[serde(default = "defaults::agent_context_window_tokens")]
     pub context_window_tokens: u32,
 
@@ -293,13 +327,20 @@ pub enum RuntimeBoundaryMode {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct OptionalAiProviderConfig {
-    /// API-key provider support is opt-in and must not change the default
-    /// Jetson local binary path.
+    /// API/OAuth provider support is opt-in for development, testing, and
+    /// transitional validation. It must not change the default Jetson local
+    /// product path.
     #[serde(default)]
     pub enabled: bool,
 
     #[serde(default)]
     pub provider: OptionalAiProviderKind,
+
+    /// Credential type used by the provider. `api_key` preserves the existing
+    /// default; `oauth_bearer` lets operators provide an OAuth access token
+    /// through `oauth_token_env` without storing the token in config.
+    #[serde(default)]
+    pub auth_mode: OptionalAiProviderAuthMode,
 
     /// Base URL or endpoint identifier for provider clients. Empty while
     /// disabled. Remote endpoints require allow_remote_base_url = true.
@@ -311,8 +352,14 @@ pub struct OptionalAiProviderConfig {
     #[serde(default = "defaults::optional_ai_provider_api_key_env")]
     pub api_key_env: String,
 
-    /// Provider path must pass the same limited-context harness before it is
-    /// promoted. Keep this at or below [agent].context_window_tokens.
+    /// Environment variable that contains an OAuth bearer access token when
+    /// `auth_mode = "oauth_bearer"`. The token value itself is never stored in
+    /// config and is not included in support summaries.
+    #[serde(default = "defaults::optional_ai_provider_oauth_token_env")]
+    pub oauth_token_env: String,
+
+    /// Provider path must pass the same limited-context harness before serious
+    /// validation. Keep this at or below [agent].context_window_tokens.
     #[serde(default = "defaults::agent_context_window_tokens")]
     pub context_window_tokens: u32,
 
@@ -326,11 +373,18 @@ impl OptionalAiProviderConfig {
         !self.enabled || self.context_window_tokens <= agent.context_window_tokens
     }
 
-    pub fn production_candidate(&self, agent: &AgentConfig) -> bool {
+    pub fn transitional_test_candidate(&self, agent: &AgentConfig) -> bool {
         self.enabled
             && self.limited_context_compatible(agent)
-            && !self.api_key_env.trim().is_empty()
+            && !self.credential_env().trim().is_empty()
             && (!is_remote_url(&self.base_url) || self.allow_remote_base_url)
+    }
+
+    pub fn credential_env(&self) -> &str {
+        match self.auth_mode {
+            OptionalAiProviderAuthMode::ApiKey => &self.api_key_env,
+            OptionalAiProviderAuthMode::OAuthBearer => &self.oauth_token_env,
+        }
     }
 }
 
@@ -339,12 +393,28 @@ impl Default for OptionalAiProviderConfig {
         Self {
             enabled: false,
             provider: OptionalAiProviderKind::OpenAiCompatible,
+            auth_mode: OptionalAiProviderAuthMode::ApiKey,
             base_url: String::new(),
             api_key_env: defaults::optional_ai_provider_api_key_env(),
+            oauth_token_env: defaults::optional_ai_provider_oauth_token_env(),
             context_window_tokens: defaults::agent_context_window_tokens(),
             allow_remote_base_url: false,
         }
     }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionalAiProviderAuthMode {
+    /// Standard provider key loaded from `api_key_env`.
+    #[default]
+    ApiKey,
+    /// OAuth access token loaded from `oauth_token_env` and sent as
+    /// `Authorization: Bearer <token>`.
+    #[serde(rename = "oauth_bearer")]
+    #[serde(alias = "oauth")]
+    #[serde(alias = "oauth2")]
+    OAuthBearer,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -448,19 +518,47 @@ fn is_remote_url(url: &str) -> bool {
     !matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SkillPolicyConfig {
     /// Reject skills without a valid sidecar manifest.
     #[serde(default)]
     pub require_manifest: bool,
 
-    /// Reject skills whose manifest does not declare signature material.
+    /// Reject skills whose `.so` bytes are not verified by a detached Ed25519
+    /// signature against a trusted key in `signature_key_dir`. The signature
+    /// is cryptographically checked before the library is loaded; a non-empty
+    /// `signature` field alone does not satisfy this.
     #[serde(default)]
     pub require_signature: bool,
+
+    /// Directory of trusted Ed25519 public keys (`<key_id>.pub`, base64) used
+    /// to verify skill signatures. Lives outside the skills directory so a
+    /// party who can drop a `.so` cannot also add a trusting key.
+    #[serde(default = "defaults::skill_signature_key_dir")]
+    pub signature_key_dir: PathBuf,
 
     /// Reject skills requesting any of these permission labels.
     #[serde(default)]
     pub denied_permissions: Vec<String>,
+
+    /// Deadline for a single native skill invocation, in milliseconds. The C
+    /// ABI call runs on a blocking thread; if it does not return within this
+    /// budget the call is abandoned and a timeout error is returned to the
+    /// caller, so a hung skill cannot freeze the async executor.
+    #[serde(default = "defaults::skill_execution_timeout_ms")]
+    pub skill_execution_timeout_ms: u64,
+}
+
+impl Default for SkillPolicyConfig {
+    fn default() -> Self {
+        Self {
+            require_manifest: false,
+            require_signature: false,
+            signature_key_dir: defaults::skill_signature_key_dir(),
+            denied_permissions: Vec::new(),
+            skill_execution_timeout_ms: defaults::skill_execution_timeout_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -476,6 +574,26 @@ pub struct ToolPolicyConfig {
     /// Tools blocked by origin. Deny rules override allow rules.
     #[serde(default)]
     pub denied_tools_by_origin: HashMap<String, Vec<String>>,
+
+    /// Per-tool sliding-window rate limit, in calls per minute, enforced at the
+    /// dispatch gate for *every* origin (issue #22). A tool not listed has no
+    /// per-tool cap; this is independent of the per-origin home actuation
+    /// limits in `[actuation_safety]`. Example:
+    /// `max_actions_per_minute_by_tool = { play_media = 10 }`.
+    #[serde(default)]
+    pub max_actions_per_minute_by_tool: HashMap<String, usize>,
+
+    /// Tools that require a two-call confirmation before they execute (issue
+    /// #22). The first call returns a pending token without running the tool; a
+    /// second call with the same origin and arguments within
+    /// `confirmation_ttl_secs` proceeds. `home_control` keeps its own richer
+    /// risk-based confirmation regardless of this list.
+    #[serde(default)]
+    pub requires_confirmation_tools: Vec<String>,
+
+    /// Validity window for a pending tool confirmation, in seconds (issue #22).
+    #[serde(default = "defaults::tool_confirmation_ttl_secs")]
+    pub confirmation_ttl_secs: u64,
 }
 
 impl Default for ToolPolicyConfig {
@@ -484,6 +602,9 @@ impl Default for ToolPolicyConfig {
             enabled: defaults::tool_policy_enabled(),
             allowed_tools_by_origin: HashMap::new(),
             denied_tools_by_origin: HashMap::new(),
+            max_actions_per_minute_by_tool: HashMap::new(),
+            requires_confirmation_tools: Vec::new(),
+            confirmation_ttl_secs: defaults::tool_confirmation_ttl_secs(),
         }
     }
 }
@@ -527,6 +648,75 @@ impl Default for ActuationSafetyConfig {
             max_actions_per_minute: defaults::actuation_max_actions_per_minute(),
             max_actions_per_minute_by_origin: HashMap::new(),
         }
+    }
+}
+
+/// Authentication for assuming a privileged request origin over HTTP (issue
+/// #232).
+///
+/// The request origin (`voice`, `dashboard`, `telegram`, …) drives per-origin
+/// tool ACLs, actuation ACLs, rate limits, audit attribution, and NLU
+/// confidence thresholds. That origin arrives as the client-supplied
+/// `X-Genie-Origin` header, so on its own it is a *forgeable* security
+/// principal: any client that can reach the port could claim `voice` to clear
+/// a higher-trust bar, or rotate origins to dodge a per-origin rate limit.
+///
+/// `genie-core` therefore only honors an origin more privileged than the
+/// untrusted `api` baseline when the request proves entitlement to it. By
+/// default that proof is the transport itself — a loopback peer is the
+/// documented single-host trust boundary (see `doc/household-security.md`) —
+/// which keeps the local dashboard, CLI, and in-process adapters working with
+/// no configuration. A non-loopback peer (i.e. `bind_host = "0.0.0.0"` reached
+/// across the LAN) cannot assume a privileged origin from the header alone; it
+/// must present a matching shared-secret token.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct OriginAuthConfig {
+    /// Require a valid token for every privileged origin, even from loopback
+    /// peers. Off by default so a single trusted host needs no setup; turn it
+    /// on to also stop one local process from impersonating another's channel.
+    #[serde(default)]
+    pub require_token: bool,
+
+    /// Map of origin name (`voice`, `dashboard`, `telegram`, `repl`) to the
+    /// shared secret a request must present in the `X-Genie-Origin-Token`
+    /// header to assume that origin. Prefer leaving the value empty here and
+    /// supplying it via the `GENIE_ORIGIN_TOKEN_<ORIGIN>` environment variable
+    /// (keep config files `0600`). An origin with no resolved token cannot be
+    /// claimed by a non-loopback peer at all.
+    #[serde(default)]
+    pub tokens: HashMap<String, String>,
+}
+
+impl OriginAuthConfig {
+    /// Resolve the effective `origin -> secret` map: the configured value
+    /// first, then the `GENIE_ORIGIN_TOKEN_<ORIGIN>` environment variable.
+    /// Blank/whitespace tokens are dropped so an empty entry can never
+    /// authenticate anything.
+    pub fn resolved_tokens(&self) -> HashMap<String, String> {
+        const KNOWN_ORIGINS: [&str; 4] = ["voice", "dashboard", "telegram", "repl"];
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        // Configured origins first, then fill any remaining known origins from
+        // the environment so `GENIE_ORIGIN_TOKEN_TELEGRAM` alone is enough.
+        let names = self.tokens.keys().map(String::as_str).chain(KNOWN_ORIGINS);
+        for name in names {
+            let key = name.trim().to_ascii_lowercase();
+            if key.is_empty() || out.contains_key(&key) {
+                continue;
+            }
+            let configured = self.tokens.get(name).map(|s| s.trim().to_string());
+            let token = match configured {
+                Some(value) if !value.is_empty() => value,
+                _ => std::env::var(format!("GENIE_ORIGIN_TOKEN_{}", key.to_ascii_uppercase()))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            };
+            if !token.is_empty() {
+                out.insert(key, token);
+            }
+        }
+        out
     }
 }
 
@@ -664,7 +854,7 @@ pub struct TelegramConfig {
 
     /// Telegram Bot API token. Can also be provided via TELEGRAM_BOT_TOKEN.
     #[serde(default)]
-    pub bot_token: String,
+    pub bot_token: Zeroizing<String>,
 
     /// Optional Telegram Bot API base URL.
     #[serde(default = "defaults::telegram_api_base")]
@@ -685,6 +875,14 @@ pub struct TelegramConfig {
     /// Voice-message handling for the Telegram channel (issue #42).
     #[serde(default)]
     pub voice: TelegramVoiceConfig,
+
+    /// Bound on concurrent in-flight update tasks. Issue #278: the poll loop
+    /// spawns a task per update with no back-pressure; this caps total
+    /// concurrent work so a message flood cannot exhaust memory or the Tokio
+    /// thread pool. Must be >= `voice.max_parallel_voice` — enforced at
+    /// startup by clamping if the config violates the invariant.
+    #[serde(default = "defaults::telegram_max_parallel_updates")]
+    pub max_parallel_updates: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -794,6 +992,86 @@ pub enum WebSearchProvider {
     Searxng,
 }
 
+/// Inbound HTTP-server hardening shared by `genie-core` (`:3000`) and
+/// `genie-api` (`:3080`).
+///
+/// These bounds protect the always-on daemon from an unauthenticated peer on
+/// the LAN: oversized request lines/headers are rejected, a stalled connection
+/// is dropped after `read_timeout_secs`, and the number of concurrent
+/// connections is capped (issue #195). The per-request body cap is fixed per
+/// server (64 KiB for genie-core, 4 KiB for genie-api) and is not part of this
+/// section.
+///
+/// It also carries the cross-origin request gate (issue #228): both servers
+/// reflect only allowlisted `Origin`s (never the old wildcard), reject
+/// non-allowlisted `Host`s (DNS-rebinding), and — when `local_api_token` is
+/// set — require that token on mutating/actuating endpoints.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HttpServerConfig {
+    /// Max bytes in the request line, newline included.
+    #[serde(default = "defaults::http_max_request_line_bytes")]
+    pub max_request_line_bytes: usize,
+
+    /// Max bytes in any single header line, newline included.
+    #[serde(default = "defaults::http_max_header_line_bytes")]
+    pub max_header_line_bytes: usize,
+
+    /// Max number of header lines per request.
+    #[serde(default = "defaults::http_max_header_count")]
+    pub max_header_count: usize,
+
+    /// Max total bytes across all header lines (the header-phase ceiling).
+    /// Mirrors the existing body cap upward into the header phase.
+    #[serde(default = "defaults::http_max_header_bytes")]
+    pub max_header_bytes: usize,
+
+    /// Deadline for reading one whole request (line + headers + body).
+    #[serde(default = "defaults::http_read_timeout_secs")]
+    pub read_timeout_secs: u64,
+
+    /// Ceiling on concurrently handled connections.
+    #[serde(default = "defaults::http_max_connections")]
+    pub max_connections: usize,
+
+    /// Extra browser `Origin`s to allow cross-origin (exact, scheme-qualified,
+    /// e.g. `http://genie.local:3000`). Loopback origins for the bound port are
+    /// always allowed; add LAN hostnames or alternate UI origins here.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+
+    /// Extra `Host` header values to allow (exact `host` or `host:port`, e.g.
+    /// `genie.local:3000`). Loopback hosts for the bound port are always
+    /// allowed; add the LAN hostname/IP the daemon is reached by here. Required
+    /// for any non-loopback access — it closes the DNS-rebinding hole.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+
+    /// Shared local API token for mutating/actuating endpoints (chat, memory
+    /// edits, actuation confirm). When set, both servers require it via
+    /// `X-Genie-Token` or `Authorization: Bearer …`; the on-device UIs receive
+    /// it automatically and genie-api forwards it to genie-core. Blank disables
+    /// token enforcement (the Origin/Host gate still applies). Can also be set
+    /// via the `GENIEPOD_LOCAL_API_TOKEN` env var.
+    #[serde(default)]
+    pub local_api_token: String,
+}
+
+impl Default for HttpServerConfig {
+    fn default() -> Self {
+        Self {
+            max_request_line_bytes: defaults::http_max_request_line_bytes(),
+            max_header_line_bytes: defaults::http_max_header_line_bytes(),
+            max_header_count: defaults::http_max_header_count(),
+            max_header_bytes: defaults::http_max_header_bytes(),
+            read_timeout_secs: defaults::http_read_timeout_secs(),
+            max_connections: defaults::http_max_connections(),
+            allowed_origins: Vec::new(),
+            allowed_hosts: Vec::new(),
+            local_api_token: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ConnectivityConfig {
     /// Enable the external connectivity coprocessor path.
@@ -861,11 +1139,11 @@ pub struct ServiceEndpoint {
 /// Result of resolving a configured service URL for the simple TCP probe
 /// path used by `genie-ctl status` / `diag` / `support-bundle`.
 ///
-/// `Http` targets are usable by a plaintext TCP client. Anything else
-/// (today: `https://`, plus unknown schemes that look like a scheme but
-/// aren't `http`) is returned as [`ServiceProbeTarget::UnsupportedScheme`]
-/// so callers can label the row instead of mis-reporting a healthy
-/// service as DOWN by sending plaintext to a TLS port.
+/// `Http` and `Https` targets are probed with the shared client in
+/// [`crate::probe`]. Unknown schemes are returned as
+/// [`ServiceProbeTarget::UnsupportedScheme`] so callers can label the row
+/// instead of mis-reporting a healthy service as DOWN by sending plaintext
+/// to a TLS port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceProbeTarget {
     /// Plain-HTTP probe target.
@@ -876,26 +1154,24 @@ pub enum ServiceProbeTarget {
         /// Request path, always starting with `/`.
         path: String,
     },
-    /// Scheme the plain-TCP probe cannot service. `genie-ctl` should skip
-    /// the probe and surface "scheme not supported" rather than DOWN.
-    /// Wiring in a TLS client is tracked separately; see issue #126
-    /// discussion.
+    /// TLS HTTP probe target (`https://` URLs).
+    Https { addr: String, path: String },
+    /// Scheme the probe client cannot service (neither plain nor TLS).
     UnsupportedScheme {
-        /// The scheme as found in the URL (lowercased), e.g. `"https"`.
+        /// The scheme as found in the URL (lowercased), e.g. `"wss"`.
         scheme: String,
     },
 }
 
 /// Parse a configured service URL into a probe target for `genie-ctl`'s
-/// plain-TCP HTTP client.
+/// HTTP/TLS probe client.
 ///
 /// Behavior:
 /// - Bare URLs without a scheme are treated as `http://…`.
 /// - `http://` URLs produce [`ServiceProbeTarget::Http`].
-/// - `https://` (and any other recognized scheme that isn't `http`) produces
-///   [`ServiceProbeTarget::UnsupportedScheme`] — the probe path cannot speak
-///   TLS, so we refuse rather than send plaintext to port 443.
-/// - Missing port defaults to 80 for `http`.
+/// - `https://` URLs produce [`ServiceProbeTarget::Https`].
+/// - Other recognized schemes produce [`ServiceProbeTarget::UnsupportedScheme`].
+/// - Missing port defaults to 80 for `http` and 443 for `https`.
 /// - Missing path defaults to `/`.
 /// - IPv6 hosts must be bracketed (`[::1]`, `[::1]:8123`); brackets are
 ///   preserved in the returned `addr` so the string parses with
@@ -910,21 +1186,55 @@ pub fn parse_service_probe_target(url: &str) -> ServiceProbeTarget {
         None => ("http", url),
     };
 
-    if scheme != "http" {
-        return ServiceProbeTarget::UnsupportedScheme {
-            scheme: scheme.to_string(),
-        };
-    }
-
     let (authority, path) = split_authority_and_path(rest);
-    let addr = ensure_port(authority, 80);
     let path = if path.is_empty() {
         "/".to_string()
     } else {
         path.to_string()
     };
 
-    ServiceProbeTarget::Http { addr, path }
+    match scheme {
+        "http" => ServiceProbeTarget::Http {
+            addr: ensure_port(authority, 80),
+            path,
+        },
+        "https" => ServiceProbeTarget::Https {
+            addr: ensure_port(authority, 443),
+            path,
+        },
+        _ => ServiceProbeTarget::UnsupportedScheme {
+            scheme: scheme.to_string(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServiceUrlDrift {
+    service: &'static str,
+    configured_url: String,
+    services_url_addr: String,
+    listen_addr: String,
+}
+
+fn record_http_url_drift(
+    drifts: &mut Vec<ServiceUrlDrift>,
+    service: &'static str,
+    configured_url: &str,
+    listen_addr: &str,
+) {
+    match parse_service_probe_target(configured_url) {
+        ServiceProbeTarget::Http { addr, .. } if addr != listen_addr => {
+            drifts.push(ServiceUrlDrift {
+                service,
+                configured_url: configured_url.to_string(),
+                services_url_addr: addr,
+                listen_addr: listen_addr.to_string(),
+            });
+        }
+        ServiceProbeTarget::Http { .. }
+        | ServiceProbeTarget::Https { .. }
+        | ServiceProbeTarget::UnsupportedScheme { .. } => {}
+    }
 }
 
 /// Split a URL into `(lowercased_scheme, rest_after_://)` when it starts
@@ -945,6 +1255,20 @@ fn split_scheme(url: &str) -> Option<(&'static str, &str)> {
         }
     }
     None
+}
+
+/// True if `dir` holds at least one `*.pub` trusted-key file. Used only for
+/// the security-posture report — the loader does the real key parsing — so a
+/// cheap presence check is enough to tell an operator whether
+/// `require_signature` is actually usable as configured.
+fn has_trusted_skill_keys(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("pub"))
+        })
+        .unwrap_or(false)
 }
 
 /// Split `authority[path]` into (authority, path). IPv6 brackets are
@@ -1010,8 +1334,23 @@ impl Config {
     pub fn load_from(path: &Path) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("failed to read config {}: {}", path.display(), e))?;
-        let config: Config = toml::from_str(&contents)?;
+        let mut config: Config = toml::from_str(&contents)?;
+        config.resolve_env_overrides();
+        config.validate_service_url_drift();
         Ok(config)
+    }
+
+    /// Fold environment-provided secrets into the parsed config so every
+    /// consumer reads them off the struct. Config file wins when set; otherwise
+    /// the env var is used. Currently only the shared local API token
+    /// (`GENIEPOD_LOCAL_API_TOKEN`, issue #228).
+    fn resolve_env_overrides(&mut self) {
+        if self.http.local_api_token.trim().is_empty()
+            && let Ok(token) = std::env::var("GENIEPOD_LOCAL_API_TOKEN")
+            && !token.trim().is_empty()
+        {
+            self.http.local_api_token = token.trim().to_string();
+        }
     }
 
     /// TCP `host:port` for local HTTP clients proxying to genie-core.
@@ -1046,6 +1385,10 @@ impl Config {
     pub fn api_http_addr(&self) -> anyhow::Result<String> {
         match parse_service_probe_target(&self.services.api.url) {
             ServiceProbeTarget::Http { addr, .. } => Ok(addr),
+            ServiceProbeTarget::Https { .. } => anyhow::bail!(
+                "genie-api cannot bind from [services.api].url: unsupported scheme \
+                 \"https\" (use http:// for the local bind address)"
+            ),
             ServiceProbeTarget::UnsupportedScheme { scheme } => anyhow::bail!(
                 "genie-api cannot bind from [services.api].url: unsupported scheme \
                  \"{scheme}\" (use http://)"
@@ -1061,21 +1404,55 @@ impl Config {
         Ok(format!("http://{}/api/status", self.api_http_addr()?))
     }
 
+    /// Compare configured service URLs against derived listen addresses and log
+    /// warnings when they disagree. Does not fail startup.
+    pub fn validate_service_url_drift(&self) {
+        for drift in self.service_url_drifts() {
+            tracing::warn!(
+                service = drift.service,
+                configured_url = %drift.configured_url,
+                services_url_addr = %drift.services_url_addr,
+                listen_addr = %drift.listen_addr,
+                "service URL host:port disagrees with listen address"
+            );
+        }
+    }
+
+    fn service_url_drifts(&self) -> Vec<ServiceUrlDrift> {
+        let mut drifts = Vec::new();
+
+        record_http_url_drift(
+            &mut drifts,
+            "core",
+            &self.services.core.url,
+            &self.core_http_addr(),
+        );
+
+        if let Ok(listen_addr) = self.api_http_addr() {
+            record_http_url_drift(&mut drifts, "api", &self.services.api.url, &listen_addr);
+        }
+
+        drifts
+    }
+
     /// Resolve the configured Home Assistant endpoint, if this deployment uses one.
     pub fn homeassistant_service(&self) -> Option<&ServiceEndpoint> {
         self.services.homeassistant.as_ref()
     }
 
     /// Resolve the Home Assistant token from config first, then the environment.
-    pub fn homeassistant_token(&self) -> Option<String> {
-        let token = if self.core.ha_token.is_empty() {
-            std::env::var("HA_TOKEN").unwrap_or_default()
+    pub fn homeassistant_token(&self) -> Option<Zeroizing<String>> {
+        let raw = if self.core.ha_token.is_empty() {
+            Zeroizing::new(std::env::var("HA_TOKEN").unwrap_or_default())
         } else {
             self.core.ha_token.clone()
         };
-
-        let token = token.trim().to_string();
-        if token.is_empty() { None } else { Some(token) }
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(Zeroizing::new(trimmed))
+        }
     }
 
     /// Whether the current deployment should manage a given service alias.
@@ -1118,15 +1495,18 @@ impl Config {
     }
 
     /// Resolve the Telegram bot token from config first, then the environment.
-    pub fn telegram_bot_token(&self) -> Option<String> {
-        let token = if self.telegram.bot_token.is_empty() {
-            std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default()
+    pub fn telegram_bot_token(&self) -> Option<Zeroizing<String>> {
+        let raw = if self.telegram.bot_token.is_empty() {
+            Zeroizing::new(std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default())
         } else {
             self.telegram.bot_token.clone()
         };
-
-        let token = token.trim().to_string();
-        if token.is_empty() { None } else { Some(token) }
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(Zeroizing::new(trimmed))
+        }
     }
 
     pub fn connectivity_enabled(&self) -> bool {
@@ -1200,6 +1580,11 @@ impl Config {
         }
         if !self.core.skill_policy.require_signature {
             risk_flags.push("skill_signature_not_required");
+        } else if !has_trusted_skill_keys(&self.core.skill_policy.signature_key_dir) {
+            // require_signature is on but no trusted keys are installed: the
+            // loader fails closed (no skill can load), so flag the misconfig
+            // rather than silently rejecting every skill.
+            risk_flags.push("skill_signature_required_but_no_trusted_keys");
         }
 
         serde_json::json!({
@@ -1238,12 +1623,15 @@ impl Config {
             "optional_ai_provider": {
                 "enabled": self.optional_ai_provider.enabled,
                 "provider": format!("{:?}", self.optional_ai_provider.provider),
+                "auth_mode": format!("{:?}", self.optional_ai_provider.auth_mode),
                 "context_window_tokens": self.optional_ai_provider.context_window_tokens,
                 "limited_context_compatible": self.optional_ai_provider.limited_context_compatible(&self.agent),
                 "allow_remote_base_url": self.optional_ai_provider.allow_remote_base_url,
                 "api_key_env_configured": !self.optional_ai_provider.api_key_env.trim().is_empty(),
+                "oauth_token_env_configured": !self.optional_ai_provider.oauth_token_env.trim().is_empty(),
                 "base_url_configured": !self.optional_ai_provider.base_url.trim().is_empty(),
-                "api_key_value_exposed": false
+                "api_key_value_exposed": false,
+                "credential_value_exposed": false
             },
             "privacy_proxy": {
                 "enabled": self.privacy_proxy.enabled,
@@ -1257,7 +1645,11 @@ impl Config {
                 "sensitive_multi_target_denied": self.core.actuation_safety.deny_multi_target_sensitive,
                 "available_state_required": self.core.actuation_safety.require_available_state,
                 "skill_manifest_required": self.core.skill_policy.require_manifest,
-                "skill_signature_required": self.core.skill_policy.require_signature
+                "skill_signature_required": self.core.skill_policy.require_signature,
+                "skill_signature_scheme": "ed25519_detached_over_so_bytes",
+                "skill_signature_key_dir": self.core.skill_policy.signature_key_dir.display().to_string(),
+                "skill_signature_trusted_keys_present": has_trusted_skill_keys(&self.core.skill_policy.signature_key_dir),
+                "skill_execution_timeout_ms": self.core.skill_policy.skill_execution_timeout_ms
             },
             "secret_presence": {
                 "homeassistant_token_configured": self.homeassistant_token().is_some(),
@@ -1328,12 +1720,13 @@ impl Default for TelegramConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bot_token: String::new(),
+            bot_token: Zeroizing::new(String::new()),
             api_base: defaults::telegram_api_base(),
             poll_timeout_secs: defaults::telegram_poll_timeout_secs(),
             allowed_chat_ids: Vec::new(),
             allow_all_chats: false,
             voice: TelegramVoiceConfig::default(),
+            max_parallel_updates: defaults::telegram_max_parallel_updates(),
         }
     }
 }
@@ -1395,6 +1788,7 @@ mod tests {
             telegram: TelegramConfig::default(),
             web_search: WebSearchConfig::default(),
             connectivity: ConnectivityConfig::default(),
+            http: HttpServerConfig::default(),
         }
     }
 
@@ -1425,6 +1819,21 @@ mod tests {
     }
 
     #[test]
+    fn core_defaults_match_current_jetson_runtime() {
+        let config = test_config();
+        assert_eq!(config.core.llm_model_name, "qwen");
+        assert_eq!(
+            config.core.llm_model_path,
+            PathBuf::from("/opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf")
+        );
+        assert_eq!(
+            config.core.whisper_model,
+            PathBuf::from("/opt/geniepod/models/ggml-small.bin")
+        );
+        assert!(config.core.wakeword_script.as_os_str().is_empty());
+    }
+
+    #[test]
     fn portable_agent_profile_parses() {
         let config: AgentConfig = toml::from_str(
             r#"
@@ -1450,6 +1859,14 @@ home_runtime_boundary = "external_runtime"
             config.optional_ai_provider.provider,
             OptionalAiProviderKind::OpenAiCompatible
         );
+        assert_eq!(
+            config.optional_ai_provider.auth_mode,
+            OptionalAiProviderAuthMode::ApiKey
+        );
+        assert_eq!(
+            config.optional_ai_provider.credential_env(),
+            "GENIEPOD_AI_PROVIDER_API_KEY"
+        );
         assert!(
             config
                 .optional_ai_provider
@@ -1458,7 +1875,7 @@ home_runtime_boundary = "external_runtime"
         assert!(
             !config
                 .optional_ai_provider
-                .production_candidate(&config.agent)
+                .transitional_test_candidate(&config.agent)
         );
     }
 
@@ -1478,7 +1895,28 @@ allow_remote_base_url = true
         .unwrap();
 
         assert!(!provider.limited_context_compatible(&agent));
-        assert!(!provider.production_candidate(&agent));
+        assert!(!provider.transitional_test_candidate(&agent));
+    }
+
+    #[test]
+    fn optional_ai_provider_can_use_oauth_bearer_env() {
+        let agent = AgentConfig::default();
+        let provider: OptionalAiProviderConfig = toml::from_str(
+            r#"
+enabled = true
+provider = "open_ai"
+auth_mode = "oauth_bearer"
+base_url = "https://api.openai.com/v1"
+oauth_token_env = "OPENAI_OAUTH_ACCESS_TOKEN"
+context_window_tokens = 4096
+allow_remote_base_url = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(provider.auth_mode, OptionalAiProviderAuthMode::OAuthBearer);
+        assert_eq!(provider.credential_env(), "OPENAI_OAUTH_ACCESS_TOKEN");
+        assert!(provider.transitional_test_candidate(&agent));
     }
 
     #[test]
@@ -1497,7 +1935,7 @@ allow_remote_base_url = false
         .unwrap();
 
         assert!(provider.limited_context_compatible(&agent));
-        assert!(!provider.production_candidate(&agent));
+        assert!(!provider.transitional_test_candidate(&agent));
     }
 
     #[test]
@@ -1600,14 +2038,13 @@ systemd_unit = "genie-ai-runtime.service"
     }
 
     #[test]
-    fn parse_service_probe_target_rejects_https_as_unsupported() {
-        // Regression for PR #127 review: HTTPS must NOT silently default to
-        // port 443 and then be probed with plaintext over a raw TcpStream —
-        // a healthy HTTPS service would be reported DOWN. Surface it as an
-        // explicit unsupported scheme so the caller can label the row.
+    fn parse_service_probe_target_parses_https_with_default_port() {
         match parse_service_probe_target("https://ha.example/api/") {
-            ServiceProbeTarget::UnsupportedScheme { scheme } => assert_eq!(scheme, "https"),
-            other => panic!("expected UnsupportedScheme for https://, got {other:?}"),
+            ServiceProbeTarget::Https { addr, path } => {
+                assert_eq!(addr, "ha.example:443");
+                assert_eq!(path, "/api/");
+            }
+            other => panic!("expected Https target, got {other:?}"),
         }
     }
 
@@ -1695,6 +2132,51 @@ systemd_unit = "genie-ai-runtime.service"
     }
 
     #[test]
+    fn validate_service_url_drift_empty_on_aligned_defaults() {
+        let config = test_config();
+        assert!(config.service_url_drifts().is_empty());
+    }
+
+    #[test]
+    fn validate_service_url_drift_detects_stale_core_port() {
+        let mut config = test_config();
+        config.core.port = 3001;
+        config.services.core.url = "http://127.0.0.1:3000/api/health".into();
+
+        let drifts = config.service_url_drifts();
+        assert_eq!(drifts.len(), 1);
+        assert_eq!(drifts[0].service, "core");
+        assert_eq!(drifts[0].services_url_addr, "127.0.0.1:3000");
+        assert_eq!(drifts[0].listen_addr, "127.0.0.1:3001");
+    }
+
+    #[test]
+    fn validate_service_url_drift_detects_core_host_mismatch() {
+        let mut config = test_config();
+        config.core.bind_host = "10.0.0.5".into();
+        config.core.port = 4000;
+        config.services.core.url = "http://127.0.0.1:3000/api/health".into();
+
+        let drifts = config.service_url_drifts();
+        assert_eq!(drifts.len(), 1);
+        assert_eq!(drifts[0].service, "core");
+        assert_eq!(drifts[0].services_url_addr, "127.0.0.1:3000");
+        assert_eq!(drifts[0].listen_addr, "10.0.0.5:4000");
+    }
+
+    #[test]
+    fn validate_service_url_drift_skips_unsupported_api_scheme() {
+        let mut config = test_config();
+        config.services.api.url = "https://api.example/api/status".into();
+        assert!(config.service_url_drifts().is_empty());
+    }
+
+    #[test]
+    fn validate_service_url_drift_no_panic_on_defaults() {
+        test_config().validate_service_url_drift();
+    }
+
+    #[test]
     fn api_http_addr_defaults_to_documented_port() {
         let config = test_config();
         assert_eq!(config.api_http_addr().unwrap(), "127.0.0.1:3080");
@@ -1754,10 +2236,10 @@ bind_host = "0.0.0.0"
     #[test]
     fn configured_homeassistant_token_is_used() {
         let mut config = test_config();
-        config.core.ha_token = "secret-token".into();
+        config.core.ha_token = "secret-token".to_string().into();
 
         assert_eq!(
-            config.homeassistant_token().as_deref(),
+            config.homeassistant_token().as_deref().map(String::as_str),
             Some("secret-token")
         );
     }
@@ -1837,10 +2319,10 @@ backend = "genie_ai_runtime"
     #[test]
     fn configured_telegram_token_is_used() {
         let mut config = test_config();
-        config.telegram.bot_token = "telegram-secret".into();
+        config.telegram.bot_token = "telegram-secret".to_string().into();
 
         assert_eq!(
-            config.telegram_bot_token().as_deref(),
+            config.telegram_bot_token().as_deref().map(String::as_str),
             Some("telegram-secret")
         );
     }
@@ -1945,6 +2427,9 @@ local_min_score = 0.91
         assert!(!config.core.skill_policy.require_manifest);
         assert!(!config.core.skill_policy.require_signature);
         assert!(config.core.skill_policy.denied_permissions.is_empty());
+        // A bounded execution deadline is always in effect, even in audit-only
+        // mode, so a hung skill can never freeze the executor by default.
+        assert_eq!(config.core.skill_policy.skill_execution_timeout_ms, 30_000);
     }
 
     #[test]
@@ -1964,6 +2449,59 @@ denied_permissions = ["network.raw", "filesystem.write"]
             config.denied_permissions,
             vec!["network.raw", "filesystem.write"]
         );
+        // Defaults to the distribution key dir when not overridden.
+        assert_eq!(
+            config.signature_key_dir,
+            PathBuf::from("/etc/geniepod/skill-keys")
+        );
+        // Omitting the key keeps the documented default deadline.
+        assert_eq!(config.skill_execution_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn skill_execution_timeout_overridable() {
+        let config: SkillPolicyConfig = toml::from_str(
+            r#"
+skill_execution_timeout_ms = 1500
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.skill_execution_timeout_ms, 1500);
+    }
+
+    #[test]
+    fn skill_policy_signature_key_dir_overridable() {
+        let config: SkillPolicyConfig = toml::from_str(
+            r#"
+require_signature = true
+signature_key_dir = "/custom/keys"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.signature_key_dir, PathBuf::from("/custom/keys"));
+    }
+
+    #[test]
+    fn security_posture_flags_require_signature_without_keys() {
+        let mut config = test_config();
+        config.core.skill_policy.require_signature = true;
+        // Point at a directory with no trusted keys → loader fails closed.
+        config.core.skill_policy.signature_key_dir =
+            PathBuf::from("/nonexistent/geniepod-skill-keys");
+
+        let posture = config.household_security_summary();
+        let flags = posture["risk_flags"].as_array().unwrap();
+        let has = |name: &str| flags.iter().any(|f| f == name);
+        assert!(has("skill_signature_required_but_no_trusted_keys"));
+        assert!(!has("skill_signature_not_required"));
+        assert_eq!(
+            posture["policy"]["skill_signature_required"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            posture["policy"]["skill_signature_trusted_keys_present"],
+            serde_json::json!(false)
+        );
     }
 
     #[test]
@@ -1972,6 +2510,21 @@ denied_permissions = ["network.raw", "filesystem.write"]
         assert!(config.core.tool_policy.enabled);
         assert!(config.core.tool_policy.allowed_tools_by_origin.is_empty());
         assert!(config.core.tool_policy.denied_tools_by_origin.is_empty());
+        assert!(
+            config
+                .core
+                .tool_policy
+                .max_actions_per_minute_by_tool
+                .is_empty()
+        );
+        assert!(
+            config
+                .core
+                .tool_policy
+                .requires_confirmation_tools
+                .is_empty()
+        );
+        assert_eq!(config.core.tool_policy.confirmation_ttl_secs, 120);
     }
 
     #[test]
@@ -1981,6 +2534,9 @@ denied_permissions = ["network.raw", "filesystem.write"]
 enabled = true
 allowed_tools_by_origin = { telegram = ["get_time", "memory_recall"] }
 denied_tools_by_origin = { voice = ["web_search"], "*" = ["play_media"] }
+max_actions_per_minute_by_tool = { play_media = 10 }
+requires_confirmation_tools = ["play_media"]
+confirmation_ttl_secs = 90
 "#,
         )
         .unwrap();
@@ -1992,6 +2548,9 @@ denied_tools_by_origin = { voice = ["web_search"], "*" = ["play_media"] }
         );
         assert_eq!(config.denied_tools_by_origin["voice"], vec!["web_search"]);
         assert_eq!(config.denied_tools_by_origin["*"], vec!["play_media"]);
+        assert_eq!(config.max_actions_per_minute_by_tool["play_media"], 10);
+        assert_eq!(config.requires_confirmation_tools, vec!["play_media"]);
+        assert_eq!(config.confirmation_ttl_secs, 90);
     }
 
     #[test]
@@ -2082,9 +2641,9 @@ expected_runtime_contract_hash = "abc123"
     fn household_security_summary_redacts_raw_config() {
         let mut config = test_config();
         config.telegram.enabled = true;
-        config.telegram.bot_token = "telegram-secret".into();
+        config.telegram.bot_token = "telegram-secret".to_string().into();
         config.telegram.allow_all_chats = true;
-        config.core.ha_token = "ha-secret".into();
+        config.core.ha_token = "ha-secret".to_string().into();
 
         let summary = config.household_security_summary();
 
@@ -2124,6 +2683,29 @@ enabled = true
 base_url = "http://127.0.0.1:8180/v1"
 trigger = "local_decline"
 vocab_path = "/vocab/seed"
+    fn http_server_config_defaults_are_bounded() {
+        let config = test_config();
+        assert_eq!(config.http.max_request_line_bytes, 8 * 1024);
+        assert_eq!(config.http.max_header_line_bytes, 8 * 1024);
+        assert_eq!(config.http.max_header_count, 100);
+        assert_eq!(config.http.max_header_bytes, 64 * 1024);
+        assert_eq!(config.http.read_timeout_secs, 15);
+        assert_eq!(config.http.max_connections, 256);
+    }
+
+    #[test]
+    fn http_server_config_falls_back_when_section_absent() {
+        // Existing deployments have no [http] section yet — the whole config
+        // must still parse and use the hardened defaults.
+        let config: Config = toml::from_str(
+            r#"
+[services.core]
+url = "http://127.0.0.1:3000/api/health"
+systemd_unit = "genie-core.service"
+
+[services.llm]
+url = "http://127.0.0.1:8080/health"
+systemd_unit = "genie-ai-runtime.service"
 "#,
         )
         .unwrap();
@@ -2140,6 +2722,20 @@ vocab_path = "/vocab/seed"
             r#"
 enabled = true
 base_url = "http://proxy.example.com/v1"
+        assert_eq!(config.http.max_header_bytes, 64 * 1024);
+        assert_eq!(config.http.max_connections, 256);
+    }
+
+    #[test]
+    fn http_server_config_parses_overrides() {
+        let config: HttpServerConfig = toml::from_str(
+            r#"
+max_request_line_bytes = 2048
+max_header_line_bytes = 2048
+max_header_count = 32
+max_header_bytes = 16384
+read_timeout_secs = 5
+max_connections = 16
 "#,
         )
         .unwrap();
@@ -2191,6 +2787,12 @@ base_url = "http://proxy.example.com/v1"
         let flags = summary["risk_flags"].to_string();
 
         assert!(flags.contains("privacy_proxy_endpoint_not_localhost"));
+        assert_eq!(config.max_request_line_bytes, 2048);
+        assert_eq!(config.max_header_line_bytes, 2048);
+        assert_eq!(config.max_header_count, 32);
+        assert_eq!(config.max_header_bytes, 16384);
+        assert_eq!(config.read_timeout_secs, 5);
+        assert_eq!(config.max_connections, 16);
     }
 
     #[test]
@@ -2278,11 +2880,14 @@ mod defaults {
     pub fn optional_ai_provider_api_key_env() -> String {
         "GENIEPOD_AI_PROVIDER_API_KEY".into()
     }
+    pub fn optional_ai_provider_oauth_token_env() -> String {
+        "GENIEPOD_AI_PROVIDER_OAUTH_TOKEN".into()
+    }
     pub fn llm_model_name() -> String {
-        "phi".into()
+        "qwen".into()
     }
     pub fn whisper_model() -> PathBuf {
-        PathBuf::from("/opt/geniepod/models/whisper-small.bin")
+        PathBuf::from("/opt/geniepod/models/ggml-small.bin")
     }
     pub fn piper_model() -> PathBuf {
         PathBuf::from("/opt/geniepod/voices/en_US-amy-medium.onnx")
@@ -2292,6 +2897,15 @@ mod defaults {
     }
     pub fn max_history_turns() -> usize {
         20
+    }
+    pub fn llm_connect_timeout_secs() -> u64 {
+        10
+    }
+    pub fn llm_read_timeout_secs() -> u64 {
+        60
+    }
+    pub fn llm_request_timeout_secs() -> u64 {
+        120
     }
     pub fn whisper_cli_path() -> PathBuf {
         PathBuf::from("/opt/geniepod/bin/whisper-cli")
@@ -2309,9 +2923,9 @@ mod defaults {
         "auto".into()
     }
     pub fn audio_denoiser() -> String {
-        // alpha.7 default: try the neural denoiser first. Runtime falls back to
-        // sox then none if the binary is absent, so this is safe even on hosts
-        // that have not run the alpha.7 setup-jetson.sh yet.
+        // Try the neural denoiser first. Runtime falls back to sox then none
+        // if the binary is absent, so this is safe on hosts that have not run
+        // the full Jetson setup script yet.
         "deepfilternet".into()
     }
     pub fn deep_filter_path() -> PathBuf {
@@ -2337,10 +2951,10 @@ mod defaults {
         3
     }
     pub fn llm_model_path() -> PathBuf {
-        PathBuf::from("/opt/geniepod/models/phi-4-mini-instruct-q4_k_m.gguf")
+        PathBuf::from("/opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf")
     }
     pub fn wakeword_script() -> PathBuf {
-        PathBuf::from("/opt/geniepod/bin/genie-wake-listen.py")
+        PathBuf::new()
     }
     pub fn speaker_identity_confidence() -> String {
         "high".into()
@@ -2351,8 +2965,17 @@ mod defaults {
     pub fn speaker_identity_min_score() -> f32 {
         0.82
     }
+    pub fn skill_signature_key_dir() -> PathBuf {
+        PathBuf::from("/etc/geniepod/skill-keys")
+    }
+    pub fn skill_execution_timeout_ms() -> u64 {
+        30_000
+    }
     pub fn tool_policy_enabled() -> bool {
         true
+    }
+    pub fn tool_confirmation_ttl_secs() -> u64 {
+        120
     }
     pub fn actuation_safety_enabled() -> bool {
         true
@@ -2414,6 +3037,13 @@ mod defaults {
         // host has more CPU / a dedicated whisper-server.
         2
     }
+    pub fn telegram_max_parallel_updates() -> usize {
+        // Issue #278: bound total concurrent update tasks to cap memory and
+        // Tokio worker pressure under a message flood. 8 is enough for a busy
+        // household bot while leaving headroom on Jetson Orin Nano. Must be
+        // >= max_parallel_voice (default 2); enforced at runtime by clamping.
+        8
+    }
     pub fn web_search_enabled() -> bool {
         true
     }
@@ -2440,6 +3070,29 @@ mod defaults {
     }
     pub fn connectivity_device() -> String {
         "esp32c6".into()
+    }
+    pub fn http_max_request_line_bytes() -> usize {
+        8 * 1024
+    }
+    pub fn http_max_header_line_bytes() -> usize {
+        8 * 1024
+    }
+    pub fn http_max_header_count() -> usize {
+        100
+    }
+    pub fn http_max_header_bytes() -> usize {
+        // Mirror the genie-core 64 KiB body cap upward into the header phase.
+        64 * 1024
+    }
+    pub fn http_read_timeout_secs() -> u64 {
+        15
+    }
+    pub fn http_max_connections() -> usize {
+        // Generous headroom over the handful of real clients (dashboard polls
+        // every 5 s, plus voice/Telegram/local apps) while still bounding fan-out
+        // so a connection flood cannot exhaust fds or wedge the single-threaded
+        // genie-core runtime.
+        256
     }
     pub fn esp32c6_uart_device() -> String {
         "/dev/ttyTHS1".into()

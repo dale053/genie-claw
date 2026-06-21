@@ -42,17 +42,32 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Build shared components.
-    let llm = llm::LlmClient::from_service_config(&config.services.llm);
-    tracing::info!(backend = %llm.backend_name(), "LLM backend configured");
+    // Build shared components. Thread the operator-configured network timeouts
+    // into the client so every chat call site inherits a bounded read (issue
+    // #181): a hung backend now fails the turn instead of wedging the daemon.
+    let llm_timeouts = llm::LlmTimeouts::from_secs(
+        config.core.llm_connect_timeout_secs,
+        config.core.llm_read_timeout_secs,
+        config.core.llm_request_timeout_secs,
+    );
+    let llm = llm::LlmClient::from_service_config_with_timeouts(&config.services.llm, llm_timeouts);
+    tracing::info!(
+        backend = %llm.backend_name(),
+        connect_timeout_secs = config.core.llm_connect_timeout_secs,
+        read_timeout_secs = config.core.llm_read_timeout_secs,
+        request_timeout_secs = config.core.llm_request_timeout_secs,
+        "LLM backend configured"
+    );
 
     let ha = ha::provider_from_config(&config);
 
     let mem_path = config.data_dir.join("memory.db");
-    let mem = memory::Memory::open(&mem_path)?;
-    tracing::info!(memories = mem.count()?, "memory loaded");
+    let memory = Arc::new(std::sync::Mutex::new(memory::Memory::open(&mem_path)?));
+    memory::with_shared_memory(&memory, |mem| {
+        tracing::info!(memories = mem.count()?, "memory loaded");
+        Ok::<(), anyhow::Error>(())
+    })?;
 
-    let mem_arc = Arc::new(std::sync::Mutex::new(memory::Memory::open(&mem_path)?));
     let skill_loader =
         skills::load_all_with_policy(skills::SkillLoadPolicy::from(&config.core.skill_policy));
     let connectivity = Arc::new(connectivity::NullConnectivityController::from_config(
@@ -65,7 +80,7 @@ async fn main() -> Result<()> {
         .with_actuation_safety_config(config.core.actuation_safety.clone())
         .with_actuation_audit_path(config.data_dir.join("safety/actuation-audit.jsonl"))
         .with_tool_audit_path(config.data_dir.join("runtime/tool-audit.jsonl"))
-        .with_memory(Arc::clone(&mem_arc))
+        .with_memory(Arc::clone(&memory))
         .with_skill_loader(skill_loader);
 
     let connectivity_health = connectivity.health().await;
@@ -79,7 +94,9 @@ async fn main() -> Result<()> {
 
     // Load user profile from /opt/geniepod/data/profile/.
     let profile_dir = config.data_dir.join("profile");
-    match genie_core::profile::load_profile(&profile_dir, &mem) {
+    match memory::with_shared_memory(&memory, |mem| {
+        genie_core::profile::load_profile(&profile_dir, mem)
+    }) {
         Ok(report) if report.total() > 0 => {
             tracing::info!(
                 toml = report.toml_facts,
@@ -104,12 +121,32 @@ async fn main() -> Result<()> {
     let model_name = &config.core.llm_model_name;
     let model_family = prompt::ModelFamily::from_model_name(model_name);
     let prompt_builder = prompt::PromptBuilder::from_model_name(model_name);
-    let system_prompt = prompt_builder.build(&tool_dispatcher.tool_defs(), &mem);
+    let system_prompt = memory::with_shared_memory(&memory, |mem| {
+        prompt_builder.build(&tool_dispatcher.tool_defs(), mem)
+    });
+    // M1 exit (issue #110): fingerprint the fully-assembled system prompt with a
+    // real SHA-256 so silent prompt drift between restarts is observable. The
+    // digest is logged here at boot and surfaced via /api/health and
+    // `genie-ctl status`.
+    let system_prompt_sha = genie_core::prompt_sha::sha256_hex(&system_prompt);
     tracing::info!(
         model = model_name,
         family = ?model_family,
-        "system prompt built"
+        prompt_bytes = system_prompt.len(),
+        system_prompt_sha = %system_prompt_sha,
+        "system prompt assembled"
     );
+
+    let boot_harness = memory::with_shared_memory(&memory, |mem| {
+        agent_harness::validate_boot_harness(
+            &system_prompt,
+            &tool_dispatcher.tool_defs(),
+            mem,
+            &config.agent,
+            &config.optional_ai_provider,
+        )
+    });
+    agent_harness::log_harness_report(&boot_harness);
 
     // Check if stdin is a terminal (REPL mode) or pipe/systemd (server-only).
     let interactive = atty_check();
@@ -120,15 +157,17 @@ async fn main() -> Result<()> {
     let conv_list = conversations.list()?;
     tracing::info!(conversations = conv_list.len(), "conversation store loaded");
 
-    let boot_contract = genie_core::server::build_runtime_contract_snapshot(
-        &tool_dispatcher,
-        &mem,
-        &conversations,
-        &system_prompt,
-        config.core.max_history_turns,
-        model_family,
-        &connectivity_health,
-    );
+    let boot_contract = memory::with_shared_memory(&memory, |mem| {
+        genie_core::server::build_runtime_contract_snapshot(
+            &tool_dispatcher,
+            mem,
+            &conversations,
+            &system_prompt,
+            config.core.max_history_turns,
+            model_family,
+            &connectivity_health,
+        )
+    });
     let contract_hash = boot_contract.contract_hash.clone();
     let contract_validation = genie_core::runtime_contract::validate_runtime_contract(
         &contract_hash,
@@ -241,7 +280,7 @@ async fn main() -> Result<()> {
                 voice_cfg,
                 &llm,
                 &tool_dispatcher,
-                &mem,
+                &memory,
                 &conversations,
                 &system_prompt,
                 config.core.max_history_turns,
@@ -259,7 +298,7 @@ async fn main() -> Result<()> {
         genie_core::repl::run(
             &llm,
             &tool_dispatcher,
-            &mem,
+            &memory,
             &conversations,
             &system_prompt,
             config.core.max_history_turns,
@@ -268,17 +307,30 @@ async fn main() -> Result<()> {
         .await
     } else {
         // Daemon mode: run HTTP server.
+        // Trusted origin resolution (issue #232): the `X-Genie-Origin` header is
+        // forgeable, so a privileged origin is only honored from a loopback peer
+        // or with a matching `[core.origin_auth]` token. The in-process Telegram
+        // adapter reaches core over loopback, but we also hand it its configured
+        // token so its `telegram` principal stays unforgeable by other local
+        // processes and keeps working under `require_token`.
+        let origin_resolver =
+            genie_core::origin_auth::OriginResolver::from_config(&config.core.origin_auth);
+
         let chat_server = genie_core::server::ChatServer::new(
             llm,
             tool_dispatcher,
             connectivity,
-            mem,
+            memory,
             conversations,
             system_prompt,
+            system_prompt_sha,
             config.core.max_history_turns,
             model_family,
             config.core.expected_runtime_contract_hash.clone(),
-        )?;
+            boot_harness,
+        )?
+        .with_http_config(config.http.clone())
+        .with_origin_auth(origin_resolver);
 
         tracing::info!(port, "starting HTTP chat API");
         if config.telegram.enabled {
@@ -305,6 +357,9 @@ async fn main() -> Result<()> {
                     );
                 }
 
+                let telegram_origin_token =
+                    config.core.origin_auth.resolved_tokens().remove("telegram");
+
                 let telegram_cfg = genie_core::telegram::TelegramRuntimeConfig {
                     api_base: config.telegram.api_base.clone(),
                     bot_token,
@@ -327,6 +382,8 @@ async fn main() -> Result<()> {
                         piper_model: config.core.piper_model.clone(),
                         max_parallel_voice: config.telegram.voice.max_parallel_voice,
                     },
+                    origin_token: telegram_origin_token.map(zeroize::Zeroizing::new),
+                    max_parallel_updates: config.telegram.max_parallel_updates,
                 };
 
                 tracing::info!(
@@ -335,6 +392,7 @@ async fn main() -> Result<()> {
                     allow_all_chats = telegram_cfg.allow_all_chats,
                     voice_enabled = telegram_cfg.voice.enabled,
                     max_parallel_voice = telegram_cfg.voice.max_parallel_voice,
+                    max_parallel_updates = telegram_cfg.max_parallel_updates,
                     "starting Telegram adapter"
                 );
 

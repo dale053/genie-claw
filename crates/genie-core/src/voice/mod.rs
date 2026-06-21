@@ -41,7 +41,14 @@ pub struct VoiceOrchestrator {
 
 impl VoiceOrchestrator {
     pub async fn new(config: Config) -> Result<Self> {
-        let llm = LlmClient::from_service_config(&config.services.llm);
+        let llm = LlmClient::from_service_config_with_timeouts(
+            &config.services.llm,
+            llm::LlmTimeouts::from_secs(
+                config.core.llm_connect_timeout_secs,
+                config.core.llm_read_timeout_secs,
+                config.core.llm_request_timeout_secs,
+            ),
+        );
 
         let ha = crate::ha::provider_from_config(&config);
         let skill_loader = crate::skills::load_all_with_policy(
@@ -68,7 +75,7 @@ impl VoiceOrchestrator {
             "You help with timers, questions, and useful household context. Home control is currently unavailable."
         };
         let system_prompt = format!(
-            "You are GeniePod Home, a local home AI for a shared living space. \
+            "You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB for a shared living space. \
              {}\n\n\
              You have these tools available. To use a tool, respond with a JSON object:\n\
              {{\"tool\": \"tool_name\", \"arguments\": {{...}}}}\n\n\
@@ -258,7 +265,17 @@ impl VoiceOrchestrator {
                 name: call.tool,
                 arguments: call.arguments,
             };
-            return Some(self.tools.execute(&tc).await);
+            return Some(
+                self.tools
+                    .execute_with_context(
+                        &tc,
+                        crate::tools::ToolExecutionContext {
+                            request_origin: crate::tools::RequestOrigin::Voice,
+                            ..Default::default()
+                        },
+                    )
+                    .await,
+            );
         }
 
         // Try finding JSON embedded in the response.
@@ -273,7 +290,17 @@ impl VoiceOrchestrator {
                     name: call.tool,
                     arguments: call.arguments,
                 };
-                return Some(self.tools.execute(&tc).await);
+                return Some(
+                    self.tools
+                        .execute_with_context(
+                            &tc,
+                            crate::tools::ToolExecutionContext {
+                                request_origin: crate::tools::RequestOrigin::Voice,
+                                ..Default::default()
+                            },
+                        )
+                        .await,
+                );
             }
         }
 

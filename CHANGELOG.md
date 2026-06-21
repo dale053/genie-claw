@@ -2,6 +2,136 @@
 
 ## Unreleased
 
+## 1.0.0-alpha.11 - 2026-06-20
+
+Alpha 11 is the **typed-tool contract + grounded BFCL** release. The single
+tool-call gate is complete, every tool now enforces its declared schema at the
+dispatch boundary (invalid calls fail and are audited rather than silently
+defaulting), and the grounded BFCL metric lifts Home-Assistant-Intents accuracy
+on the 4096-token Jetson Orin path (raw 20%→51%, grounded 72%→83%).
+
+- **Single tool-call gate: chokepoint, confirmation, per-tool rate limits**
+  (#22, #365, #374): every tool invocation passes one enforced gate. The voice
+  `web_search` quick-path and the `voice::VoiceAssistant` / `voice::pipeline`
+  fall-back paths now flow through the dispatcher gate as `RequestOrigin::Voice`,
+  so per-origin ACLs, rate limits, and the audit trail apply uniformly. New
+  `[core.tool_policy]` mechanisms: `max_actions_per_minute_by_tool` (per-tool
+  sliding-window limit, `"*"` catch-all) and `requires_confirmation_tools` +
+  `confirmation_ttl_secs` (two-call confirmation with a stable token inside a TTL
+  window). Every gate decision (`executed`, `denied_policy`, `rate_limited`,
+  `pending_confirmation`, `confirmation_expired`) is recorded on the tool-audit
+  line.
+- **Typed-tool argument enforcement at the execution boundary**: invalid tool
+  calls (missing / empty / whitespace / wrong-type required args) now fail with
+  `success: false`, a schema error, and a tool-audit failure entry instead of a
+  silent default or polite soft-success. Hardened: `set_timer` (#360),
+  `memory_recall` (#362), `home_status` (#346), `calculate` (#392; unary-minus
+  grammar #326), `play_media` (#393), `home_control` action synonyms (#400) and
+  value (#414), `get_weather` (#409), `web_search` (#412), `memory_forget` (#413,
+  gated on `MemoryReadContext` #389), and `memory_store` (#416). Unparsed
+  tool-call JSON is no longer leaked to the user (#380).
+- **Whole-home entity fidelity guard at runtime** (#419): wrong-room / foreign
+  queries (`"upstairs lights"`, `"living room light"`) no longer collapse to the
+  only device of a domain on live `home_control` / `home_status` — the BFCL
+  fidelity guard now runs in the shared resolver, returning a clear "couldn't
+  find it" instead of mis-actuating.
+- **Grounded BFCL metric** (#387, #388, #390): grounded entity-argument scoring,
+  action-synonym canonicalization, and a wrong-room fidelity guard for the
+  scorer; grounding the predict prompt in the home device catalog (#399) lifts
+  raw 20%→51% and grounded 72%→83% on the Jetson HA-Intents import.
+- **Voice**: TTS synthesis pipelined to overlap with playback (#406); sentence
+  segmentation with look-ahead so decimals/abbreviations don't split (#386);
+  `apply_voice_eq` high-cut fix (#324); Jetson-tuned voice defaults (#407).
+- **Memory & reliability**: per-turn hydration capped at the 700-token M1 budget
+  (#345); `AuditLogger` / `ToolAuditLogger` surface IO failures (#329); the API
+  distinguishes 503 (transient) vs 500 (permanent) for tegrastats DB errors
+  (#299); Telegram bounds concurrent update tasks + evicts idle chat locks
+  (#279); `validate_inference_route` loopback check for `remote_url` (#328); API
+  confirmation required for non-Low actuation risk (#356).
+- **Deploy & build**: ship all `deploy/scripts` to the Jetson + `genie-drop-caches.sh`
+  (#382, #384); run the 4096-token agent harness at boot (#342); faster local
+  builds — skip release LTO in `cargo test`, lighter dev debuginfo (#381);
+  `genie-ctl` surfaces `agent_harness` in status / health / diag (#364, #396).
+- **Docs**: README restructured around the M1/M2/M3 milestones (#352), accepted
+  contribution scope + runnable sample Home Assistant (#401), and the five-pillar
+  edge thesis (#397).
+
+## 1.0.0-alpha.10 - 2026-05-29
+
+Alpha 10 is the **Jetson-context harness + BFCL measurement** release. It
+keeps GenieClaw focused on the 4096-token NVIDIA Jetson Orin 8GB contract,
+records the current Home Assistant Intents BFCL quick-router baseline, and
+continues hardening local memory, tool routing, HTTP safety, and voice-facing
+runtime behavior.
+
+Current measured BFCL baseline for the Home Assistant Intents English import:
+208 cases, 208 generated quick-router predictions, 0 missing predictions, and
+5.77% strict tool-call accuracy. This is intentionally tracked as a baseline,
+not as a product-quality target; the next accuracy work is deterministic
+intent routing, entity/slot normalization, and typed-tool argument accuracy
+for high-signal home commands.
+
+- **CORS lockdown + local API token** (#228): the hand-rolled HTTP servers in
+  both `genie-core` (`:3000`) and `genie-api` (`:3080`) previously answered
+  every request with a wildcard `Access-Control-Allow-Origin: *` and did no
+  `Origin`/`Host` validation, so any web page the user opened could read
+  private conversations/memories and drive home actuation cross-origin. A new
+  shared request gate (`genie_common::http::RequestGuard`) now runs ahead of
+  routing in both crates and: (1) reflects only an allowlisted `Origin`
+  (loopback for the bound port is always allowed; LAN hostnames/origins are
+  opt-in via `[http].allowed_origins` / `allowed_hosts`) and never the
+  wildcard; (2) rejects a non-allowlisted `Host` with `403`, closing the
+  DNS-rebinding hole; and (3) when `[http].local_api_token` (or
+  `GENIEPOD_LOCAL_API_TOKEN`) is set, requires that token via `X-Genie-Token`
+  or `Authorization: Bearer …` on every mutating/actuating endpoint
+  (`/api/chat*`, `/api/memories/*`, `/api/actuation/confirm`, `/api/mode`,
+  `/v1/chat/completions`). The on-device chat UI and dashboard receive the
+  token by HTML injection and send it automatically; genie-api forwards it on
+  its proxy hop to genie-core. `HttpServerConfig` loses `Copy` to carry the new
+  fields. Existing loopback-only deployments keep working unchanged (token
+  blank → gate-only); the sample `geniepod.toml` documents the new keys.
+- **System-prompt SHA** (#110): the fully-assembled system prompt (persona,
+  tools, and hydrated household memory) is now fingerprinted with a real
+  SHA-256 at boot, satisfying the M1 exit criterion that the prompt stays
+  deterministic across a full-stack restart. New pure-Rust `prompt_sha`
+  module (no crypto dependency, pinned to the FIPS-180 known-answer vectors)
+  computes the digest; genie-core logs it during boot, exposes it as
+  `system_prompt_sha` on `/api/health`, and `genie-ctl status` prints it as
+  `Prompt:`. A new `prompt_sha_test` integration test boots the prompt
+  assembly twice from identical config + hydrated state and asserts an
+  identical SHA, plus asserts that a prompt-assembly or hydration change
+  shifts the digest — so silent prompt drift between runs becomes a visible
+  hash mismatch instead of an undetected behavior change.
+- **Bounded LLM reads + observable chat liveness** (#181): a single hung
+  backend read could take down chat across every channel — unrecoverable
+  without a daemon restart — while `/api/health` stayed green. Two layers were
+  unbounded together. (1) `OpenAiCompatClient` only timed out on the
+  *non-streaming connect*; the streaming `TcpStream::connect` and **every** read
+  (`read_line`/`read_exact`/`read_to_string`/`next_line`) had no timeout, so a
+  backend that accepted a connection then stalled (e.g. mid governor model swap)
+  hung forever. Now every connect, read, and write is bounded by configurable
+  timeouts (`core.llm_connect_timeout_secs` / `llm_read_timeout_secs` /
+  `llm_request_timeout_secs`), threaded through `LlmClient::from_service_config`
+  so all call sites (web, OpenAI bridge, voice, REPL, Telegram) inherit the
+  bound. (2) The server held the process-wide `chat_turn_lock` across that
+  unbounded read, serializing the whole appliance behind one stuck turn. The
+  bare `Mutex<()>` is replaced by a `ChatTurnGate` with **bounded acquisition**
+  (a turn that can't get the lock within budget gets a `503 chat busy` instead
+  of blocking forever) and **liveness tracking**: `/api/health` now reports a
+  `chat` block (`in_flight`, `last_turn_age_secs`, `current_turn_age_secs`,
+  `waiters`, `wedged`) and flips overall status to `degraded` when a turn is
+  wedged, so monitoring can no longer show green while chat is stuck. The gate's
+  waiter count is held by an RAII guard that decrements on every exit path, so a
+  request cancelled (dropped) while parked on the gate — e.g. a client disconnect
+  or shutdown aborting the per-connection task — cannot leak a phantom waiter into
+  the health snapshot. Tests cover the stuck-runtime recovery path: a concurrent
+  turn gets `503 chat busy` while one is blocked, the `wedged`/`degraded` fields
+  recover to `ok` once the stuck turn releases, and a cancelled waiter leaves the
+  count at zero. The dead,
+  never-wired `RetryLlmClient` module (the only place a timeout previously lived,
+  reachable solely via `#[allow(unused_imports)]`) is removed; its timeout
+  semantics now live at the client read layer where every call site inherits
+  them.
 - **Crash fix: non-ASCII backend error bodies** (#147): `truncate_body`
   in `llm/openai_compat.rs` sliced the response body at a fixed 240-byte
   offset (`&trimmed[..240]`). When that offset landed inside a multi-byte

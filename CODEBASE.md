@@ -43,7 +43,10 @@ The most important runtime path is:
 
 1. A request enters through the web UI, CLI, REPL, voice loop, or Telegram adapter.
 2. `genie-core` builds prompt context from conversation history and household memory.
-3. The LLM client talks to the local `llama.cpp`-compatible server.
+3. The LLM facade talks to the configured OpenAI-compatible backend. Jetson
+   deploys default to local `genie-ai-runtime`; development configs can still
+   use a local `llama.cpp` server. Remote/API providers are transitional
+   testing adapters only.
 4. If the model emits a tool call, the tool parser and dispatcher execute the tool.
 5. Tool results may be returned directly or summarized, depending on the tool.
 6. Conversation state and extracted memory are persisted to SQLite.
@@ -62,7 +65,7 @@ Around that path:
 | `Cargo.lock` | Locked dependency graph. |
 | `Makefile` | Main developer and Jetson deploy entry points: build, test, release, cross-compile, and deploy. |
 | `Dockerfile` | Multi-stage container build for the local dev/runtime image. |
-| `docker-compose.dev.yml` | Dev stack for `genie-core`, `genie-api`, and a local `llama.cpp` server. |
+| `docker-compose.dev.yml` | Dev stack for `genie-core`, `genie-api`, and a local OpenAI-compatible model server. |
 | `README.md` | Product-level overview and repo orientation. |
 | `GETTING_STARTED.md` | Local dev, Docker, and Jetson bring-up guide. |
 | `ARCHITECTURE.md` | Higher-level system architecture narrative. |
@@ -110,8 +113,11 @@ The primary runtime. This is where most product behavior lives.
 | Path | Purpose |
 | --- | --- |
 | `crates/genie-core/src/llm/mod.rs` | LLM module exports. |
-| `crates/genie-core/src/llm/client.rs` | Raw TCP/OpenAI-compatible chat client for the local inference server, including streaming and compatibility fallbacks. |
-| `crates/genie-core/src/llm/retry.rs` | Retry and graceful fallback layer around the base client. |
+| `crates/genie-core/src/llm/openai_compat.rs` | Raw bounded OpenAI-compatible HTTP client used by local and optional provider backends. |
+| `crates/genie-core/src/llm/genie_ai_runtime.rs` | Adapter for the default Jetson `genie-ai-runtime` backend and its request hints. |
+| `crates/genie-core/src/llm/llama_cpp.rs` | Adapter for the legacy/development `llama.cpp` backend. |
+| `crates/genie-core/src/llm/openai_compatible.rs` | Generic OpenAI-compatible provider adapter with bearer-token support for development/testing validation. |
+| `crates/genie-core/src/llm/provider.rs` | Optional provider planning and limited-context readiness checks for transitional provider validation. |
 
 #### Home Assistant Integration
 

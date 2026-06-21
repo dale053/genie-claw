@@ -9,6 +9,8 @@ The practical reason is simple:
 - local inference and local voice must fit in a constrained memory budget
 - service count must stay low
 - operational behavior has to remain understandable under pressure
+- ordinary home-agent turns should stay fast by using compact prompt context,
+  relevant memory, and typed tools instead of larger remote prompts
 
 ## Deploy Assets In This Repo
 
@@ -25,10 +27,15 @@ The practical reason is simple:
 - `deploy/systemd/genie-api.service`
 - `deploy/systemd/genie-governor.service`
 - `deploy/systemd/genie-health.service`
+- `deploy/systemd/genie-ai-runtime.service`
+- `deploy/systemd/genie-ai-runtime-warmup.service`
 - `deploy/systemd/genie-llm.service`
+- `deploy/systemd/genie-llm-warmup.service`
 - `deploy/systemd/genie-mqtt.service`
 - `deploy/systemd/genie-audio.service`
 - `deploy/systemd/genie-wakeword.service`
+- `deploy/systemd/genie-whisper.service`
+- `deploy/systemd/genie-whisper-warmup.service`
 - `deploy/systemd/homeassistant.service`
 - `deploy/systemd/geniepod.target`
 - `deploy/systemd/geniepod-late.target`
@@ -49,10 +56,35 @@ The practical reason is simple:
 
 ## Supported Bring-Up Styles
 
+### Maintained SBC Profiles
+
+Jetson remains the flagship deployment target, but Raspberry Pi and generic
+portable SBC profiles are maintained for the headless agent path.
+
+Maintained means these surfaces should remain usable without Jetson-only
+assumptions:
+
+- config loading with `[agent].runtime_profile = "raspberry_pi"` or
+  `"portable_sbc"`
+- `genie-core` HTTP/chat surfaces
+- `genie-ctl` CLI surfaces
+- memory and tool routing
+- Home Assistant or fake home-provider boundaries
+- optional provider/test harness paths
+
+Voice, CUDA acceleration, `genie-ai-runtime`, and Jetson-specific systemd
+behavior may be unavailable or replaced by lighter local services on those
+profiles.
+
 ### Dev Machine
 
-Use `deploy/config/geniepod.dev.toml` and point `genie-core` at a local
-`llama-server`.
+Use `deploy/config/geniepod.dev.toml` and point `genie-core` at any local
+OpenAI-compatible model server. The checked-in dev config uses `llama.cpp`
+on `:8080`.
+
+Remote/API providers can help with development and transitional validation, but
+they are not the production product path. The Jetson target remains local
+`genie-ai-runtime` plus the limited-context home harness.
 
 Main references:
 
@@ -75,7 +107,8 @@ Use `deploy/setup-jetson.sh` and the systemd units under `deploy/systemd/`.
 
 Typical production expectations:
 
-- `genie-llm.service` provides the local model server
+- `genie-ai-runtime.service` provides the default local model server
+- `genie-llm.service` is available as the legacy `llama.cpp` fallback
 - `genie-core.service` exposes the main runtime on `127.0.0.1:3000` by default
 - `genie-governor.service` and `genie-health.service` are active
 - `genie-api.service` serves dashboard/status
@@ -90,9 +123,9 @@ the safe default.
 Common commands:
 
 ```bash
-systemctl status genie-core genie-governor genie-health genie-api genie-llm
+systemctl status genie-core genie-governor genie-health genie-api genie-ai-runtime
 journalctl -u genie-core -n 200 --no-pager
-journalctl -u genie-llm -n 200 --no-pager
+journalctl -u genie-ai-runtime -n 200 --no-pager
 curl -s http://127.0.0.1:3000/api/health
 curl -s http://127.0.0.1:3000/api/tools
 genie-ctl status
@@ -186,18 +219,20 @@ These are current system realities, not bugs in the docs:
 
 - LLM context size is constrained by Jetson memory and model choice.
 - Voice mode is more sensitive to process scheduling, audio-device selection, and GPU time-sharing than plain chat mode.
-- The connectivity boundary exists, but full ESP-Hosted-NG OS ownership belongs in `genie-os`, not in this runtime repo.
+- The connectivity boundary exists, but full ESP-Hosted-NG OS ownership belongs in the platform/OS layer, not in this runtime repo.
 - The ESP32-C6 UART path is currently a health/capability boundary, not a full Thread/Matter controller implementation.
 - Local speaker identity is useful for household memory routing, not security-grade authentication.
 - Multilingual voice depends on installed STT/TTS models and per-language device testing.
 - Vector/cuVS semantic memory is design work; the implemented memory runtime uses SQLite FTS today.
 - Web search is intentionally limited to low-risk public lookups and can be disabled completely.
+- Optional OpenAI-compatible/API/OAuth providers are for testing and development
+  portability during transition, not for replacing the private on-device path.
 
 ## Suggested Health Checks
 
 Minimum checks after deployment:
 
-1. Verify `llama-server` health.
+1. Verify the configured LLM backend health, normally `genie-ai-runtime`.
 2. Verify `genie-core` health and tool list.
 3. Verify `genie-governor` socket and status.
 4. Verify `genie-api` dashboard/status responses.
@@ -210,7 +245,7 @@ Minimum checks after deployment:
 | Symptom | First Place To Check |
 | --- | --- |
 | Chat UI loads but no answers | `genie-core` logs and `/api/health` |
-| `llm: offline` | `genie-llm.service` and `llama-server` flags |
+| `llm: offline` | configured LLM unit (`genie-ai-runtime.service` by default, `genie-llm.service` for llama.cpp fallback) and `/api/health` backend details |
 | Wrong or missing Home Assistant behavior | Home Assistant service config, token resolution, `ha/` boundary logs |
 | Voice hears but does not answer | STT path, language selection, Piper path, audio device |
 | Governor appears offline | `/run/geniepod/governor.sock` and `genie-governor.service` |

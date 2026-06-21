@@ -14,8 +14,10 @@ home_runtime_boundary = "transitional_adapter"
 [optional_ai_provider]
 enabled = false
 provider = "open_ai_compatible"
+auth_mode = "api_key"
 base_url = ""
 api_key_env = "GENIEPOD_AI_PROVIDER_API_KEY"
+oauth_token_env = "GENIEPOD_AI_PROVIDER_OAUTH_TOKEN"
 context_window_tokens = 4096
 allow_remote_base_url = false
 
@@ -48,7 +50,10 @@ expected_runtime_contract_hash = ""  # Optional: pin after a known-good boot.
 
 # [core.skill_policy]
 # require_manifest = false
-# require_signature = false
+# require_signature = false   # true => verify a trusted Ed25519 signature over
+#                             # the .so bytes before dlopen (presence of a
+#                             # signature string is not enough)
+# signature_key_dir = "/etc/geniepod/skill-keys"  # holds <key_id>.pub keys
 # denied_permissions = ["network.raw", "filesystem.write"]
 
 # [core.tool_policy]
@@ -65,6 +70,13 @@ expected_runtime_contract_hash = ""  # Optional: pin after a known-good boot.
 # allowed_origins = ["voice", "dashboard", "api", "telegram", "repl", "confirmation"]
 # max_actions_per_minute = 12
 # max_actions_per_minute_by_origin = { telegram = 3, voice = 8 }
+
+# Trusted request-origin auth (issue #232). The X-Genie-Origin header is
+# forgeable, so a privileged origin is only honored from a loopback peer or with
+# a matching token. Localhost-only dev needs nothing here.
+# [core.origin_auth]
+# require_token = false
+# tokens = { dashboard = "", telegram = "" }   # Prefer GENIE_ORIGIN_TOKEN_<ORIGIN>.
 
 [web_search]
 enabled = true

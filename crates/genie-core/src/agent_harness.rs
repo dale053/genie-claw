@@ -2,17 +2,20 @@
 //!
 //! The goal is to keep prompt, tools, memory hydration, safety, and optional
 //! provider paths usable inside the Jetson 4096-token baseline before any
-//! deployment opts into a larger adaptive context.
+//! deployment opts into a larger adaptive context. Low latency and answer
+//! quality should come from selecting the right home context, not from widening
+//! prompts by default.
 
 use genie_common::config::{AgentConfig, OptionalAiProviderConfig};
 use serde::Serialize;
 
+use crate::memory::Memory;
 use crate::runtime_boundary::JETSON_BASELINE_CONTEXT_TOKENS;
 use crate::tools::dispatch::ToolDef;
 
 pub const RESPONSE_RESERVE_TOKENS: usize = 512;
 pub const TOOL_MANIFEST_BUDGET_TOKENS: usize = 900;
-pub const MEMORY_HYDRATION_BUDGET_TOKENS: usize = 900;
+pub const MEMORY_HYDRATION_BUDGET_TOKENS: usize = 700;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HarnessCheck {
@@ -107,10 +110,52 @@ pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
+/// Evaluate the Jetson limited-context harness against the boot-time prompt,
+/// live tool manifest, and a representative per-turn memory hydration sample.
+pub fn validate_boot_harness(
+    system_prompt: &str,
+    tools: &[ToolDef],
+    memory: &Memory,
+    agent: &AgentConfig,
+    provider: &OptionalAiProviderConfig,
+) -> LimitedContextHarnessReport {
+    let memory_context =
+        crate::memory::inject::build_memory_context(memory, "turn on the kitchen lights");
+    validate_limited_context_agent(system_prompt, tools, &memory_context, agent, provider)
+}
+
+pub fn log_harness_report(report: &LimitedContextHarnessReport) {
+    if report.pass {
+        tracing::info!(
+            pass = report.pass,
+            context_window_tokens = report.context_window_tokens,
+            estimated_total_tokens = report.estimated_total_tokens,
+            response_reserve_tokens = report.response_reserve_tokens,
+            "agent harness passed Jetson limited-context checks"
+        );
+        return;
+    }
+
+    for check in report.checks.iter().filter(|check| !check.pass) {
+        tracing::warn!(
+            check = check.name,
+            detail = %check.detail,
+            "agent harness check failed"
+        );
+    }
+    tracing::warn!(
+        pass = report.pass,
+        context_window_tokens = report.context_window_tokens,
+        estimated_total_tokens = report.estimated_total_tokens,
+        response_reserve_tokens = report.response_reserve_tokens,
+        "agent harness failed Jetson limited-context checks"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use genie_common::config::OptionalAiProviderKind;
+    use genie_common::config::{OptionalAiProviderAuthMode, OptionalAiProviderKind};
 
     fn sample_tool(name: &str) -> ToolDef {
         ToolDef {
@@ -136,7 +181,7 @@ mod tests {
         ];
 
         let report = validate_limited_context_agent(
-            "You are GeniePod Home. Use tools only when needed.",
+            "You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB. Use tools only when needed.",
             &tools,
             "Household context: kitchen light is in the kitchen.",
             &agent,
@@ -145,6 +190,7 @@ mod tests {
 
         assert!(report.pass, "{:?}", report.checks);
         assert!(report.estimated_total_tokens < 4096);
+        assert_eq!(MEMORY_HYDRATION_BUDGET_TOKENS, 700);
     }
 
     #[test]
@@ -154,7 +200,7 @@ mod tests {
         let memory_context = "remembered household detail. ".repeat(500);
 
         let report = validate_limited_context_agent(
-            "You are GeniePod Home.",
+            "You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB.",
             &[sample_tool("memory_recall")],
             &memory_context,
             &agent,
@@ -176,14 +222,16 @@ mod tests {
         let provider = OptionalAiProviderConfig {
             enabled: true,
             provider: OptionalAiProviderKind::OpenAiCompatible,
+            auth_mode: OptionalAiProviderAuthMode::ApiKey,
             base_url: "https://provider.example/v1".into(),
             api_key_env: "GENIE_PROVIDER_KEY".into(),
+            oauth_token_env: "GENIE_PROVIDER_OAUTH_TOKEN".into(),
             context_window_tokens: 8192,
             allow_remote_base_url: true,
         };
 
         let report = validate_limited_context_agent(
-            "You are GeniePod Home.",
+            "You are GenieClaw, a local home AI native to NVIDIA Jetson Orin 8GB.",
             &[sample_tool("get_time")],
             "",
             &agent,
