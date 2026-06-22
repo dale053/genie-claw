@@ -3662,7 +3662,10 @@ mod tests {
 
         let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
         assert!(
-            mem.search("Maya", 5).unwrap().iter().any(|e| e.content.contains("oat milk")),
+            mem.search("Maya", 5)
+                .unwrap()
+                .iter()
+                .any(|e| e.content.contains("oat milk")),
             "person-scoped fact must be persisted with verified identity context"
         );
     }
