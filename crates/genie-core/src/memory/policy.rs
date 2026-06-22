@@ -668,7 +668,10 @@ mod tests {
     fn household_normal_memory_is_anonymized_eligible() {
         let metadata = infer_metadata("preference", "User likes jazz music");
         assert_eq!(escalation_policy(metadata), EscalationPolicy::Anonymized);
-        assert!(eligible_for_escalation("preference", "User likes jazz music"));
+        assert!(eligible_for_escalation(
+            "preference",
+            "User likes jazz music"
+        ));
     }
 
     #[test]
@@ -709,7 +712,10 @@ mod tests {
 
     #[test]
     fn person_linked_normal_memory_is_anonymized_eligible() {
-        assert!(eligible_for_escalation("person_preference", "Maya likes oat milk"));
+        assert!(eligible_for_escalation(
+            "person_preference",
+            "Maya likes oat milk"
+        ));
     }
 
     #[test]

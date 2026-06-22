@@ -84,11 +84,9 @@ impl PrivacyProxyBackend {
         let body = serde_json::to_string(&serde_json::json!({ "terms": terms }))?;
         let addr = format!("{}:{}", self.host, self.port);
 
-        let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            TcpStream::connect(&addr),
-        )
-        .await??;
+        let stream =
+            tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr))
+                .await??;
 
         let (_, mut writer) = stream.into_split();
         let request = format!(
@@ -150,7 +148,9 @@ impl LlmBackendClient for PrivacyProxyBackend {
         max_tokens: Option<u32>,
         on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> Result<String> {
-        self.client.chat_stream(messages, max_tokens, on_token).await
+        self.client
+            .chat_stream(messages, max_tokens, on_token)
+            .await
     }
 }
 

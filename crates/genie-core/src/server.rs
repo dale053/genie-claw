@@ -1242,12 +1242,8 @@ pub async fn process_chat_turn(
                         error = %local_err,
                         "local LLM declined; escalating via PrivacyProxy"
                     );
-                    match escalate_via_privacy_proxy(
-                        privacy_proxy.unwrap(),
-                        &messages,
-                        memory,
-                    )
-                    .await
+                    match escalate_via_privacy_proxy(privacy_proxy.unwrap(), &messages, memory)
+                        .await
                     {
                         Ok(r) => r,
                         Err(proxy_err) => {
@@ -1326,9 +1322,7 @@ async fn escalate_via_privacy_proxy(
         Ok::<Vec<String>, anyhow::Error>(
             entries
                 .into_iter()
-                .filter(|e| {
-                    crate::memory::policy::eligible_for_escalation(&e.kind, &e.content)
-                })
+                .filter(|e| crate::memory::policy::eligible_for_escalation(&e.kind, &e.content))
                 .map(|e| e.content)
                 .collect(),
         )

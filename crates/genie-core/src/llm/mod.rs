@@ -2,8 +2,8 @@ mod genie_ai_runtime;
 mod llama_cpp;
 mod mock;
 mod openai_compat;
-pub mod privacy_proxy;
 mod openai_compatible;
+pub mod privacy_proxy;
 mod provider;
 
 use anyhow::Result;
@@ -14,8 +14,8 @@ pub use genie_ai_runtime::GenieAiRuntimeBackend;
 pub use llama_cpp::LlamaCppBackend;
 pub use mock::MockLlmBackend;
 pub use openai_compat::{LlmTimeouts, Message, ResponseFormat};
-pub use privacy_proxy::PrivacyProxyBackend;
 pub use openai_compatible::OpenAiCompatibleBackend;
+pub use privacy_proxy::PrivacyProxyBackend;
 pub use provider::{OptionalProviderPlan, ProviderReadiness};
 
 #[async_trait]
@@ -353,10 +353,7 @@ mod tests {
 
     #[test]
     fn privacy_proxy_client_has_correct_backend_name() {
-        let client = LlmClient::from_privacy_proxy_url(
-            "http://127.0.0.1:8180/v1",
-            "/vocab/seed",
-        );
+        let client = LlmClient::from_privacy_proxy_url("http://127.0.0.1:8180/v1", "/vocab/seed");
         assert_eq!(client.backend_name(), "privacy-proxy");
     }
 
