@@ -72,15 +72,13 @@ impl PromptBuilder {
             | ModelFamily::Llama
             | ModelFamily::Qwen
             | ModelFamily::Phi
-            | ModelFamily::Gemma => {
-                self.prompt_capable_model(
-                    &tool_section,
-                    &memory_section,
-                    home_tools_available,
-                    hello_world_available,
-                    web_search_available,
-                )
-            }
+            | ModelFamily::Gemma => self.prompt_capable_model(
+                &tool_section,
+                &memory_section,
+                home_tools_available,
+                hello_world_available,
+                web_search_available,
+            ),
             ModelFamily::Small | ModelFamily::Generic => self.prompt_simple_model(
                 &tool_section,
                 &memory_section,
