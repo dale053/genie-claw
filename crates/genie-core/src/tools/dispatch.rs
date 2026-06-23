@@ -3577,7 +3577,10 @@ mod tests {
 
         let result = dispatcher
             .exec_memory_store(
-                &serde_json::json!({"content": "my name is Jared", "category": "identity"}),
+                &serde_json::json!({
+                    "content": "my name is Jared",
+                    "category": "identity"
+                }),
                 ToolExecutionContext::default(),
             )
             .unwrap();
@@ -3603,7 +3606,10 @@ mod tests {
 
         let result = dispatcher
             .exec_memory_store(
-                &serde_json::json!({"content": "my name is Alice", "category": "identity"}),
+                &serde_json::json!({
+                    "content": "my name is Alice",
+                    "category": "identity"
+                }),
                 ToolExecutionContext::default(),
             )
             .unwrap();
