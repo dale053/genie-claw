@@ -148,17 +148,20 @@ fn parse_set_timer_args(args: &serde_json::Value) -> Result<(u64, &str)> {
     Ok((seconds, label))
 }
 
-fn parse_memory_recall_query(args: &serde_json::Value) -> Result<String> {
-    let raw = args
-        .get("query")
+fn parse_memory_query_arg(args: &serde_json::Value) -> Result<&str> {
+    args.get("query")
         .or_else(|| args.get("topic"))
         .or_else(|| args.get("what"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!("memory_recall requires non-empty string argument 'query'")
-        })?;
+            anyhow::anyhow!("memory tool requires non-empty string argument (query/topic/what)")
+        })
+}
+
+fn parse_memory_recall_query(args: &serde_json::Value) -> Result<String> {
+    let raw = parse_memory_query_arg(args)?;
     Ok(normalize_memory_recall_query(raw))
 }
 
@@ -174,11 +177,7 @@ fn normalize_memory_recall_query(raw: &str) -> String {
 }
 
 fn parse_memory_forget_query(args: &serde_json::Value) -> Result<&str> {
-    args.get("query")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("memory_forget requires non-empty string argument 'query'"))
+    parse_memory_query_arg(args)
 }
 
 /// Reject a `memory_store` call with no usable `content` (#416). Delegates to
@@ -1099,6 +1098,7 @@ impl ToolDispatcher {
                 confidence: None,
                 action_id: None,
                 undo_of: None,
+                undo_restore: None,
             });
             anyhow::bail!("Home action blocked by channel policy: {}", reason);
         }
@@ -1124,6 +1124,7 @@ impl ToolDispatcher {
                 confidence: None,
                 action_id: None,
                 undo_of: None,
+                undo_restore: None,
             });
             anyhow::bail!("Home action blocked by rate limit: {}", reason);
         }
@@ -1190,6 +1191,7 @@ impl ToolDispatcher {
                     confidence,
                     action_id: Some(recorded.id),
                     undo_of: recorded.undo_of,
+                    undo_restore: recorded.undo_restore.clone(),
                 });
                 Ok(output)
             }
@@ -1217,6 +1219,7 @@ impl ToolDispatcher {
                     confidence: None,
                     action_id: None,
                     undo_of: None,
+                    undo_restore: None,
                 });
                 // The token is a bearer secret: a leaked one is a reusable
                 // door-unlock credential for its full validity window. Keep it
@@ -1250,6 +1253,7 @@ impl ToolDispatcher {
                     confidence: None,
                     action_id: None,
                     undo_of: None,
+                    undo_restore: None,
                 });
                 Err(anyhow::anyhow!(error))
             }
@@ -1284,11 +1288,7 @@ impl ToolDispatcher {
         if !actions.is_empty() {
             lines.push("Recent home actions:".to_string());
             for action in actions.iter().take(5) {
-                let undo = action
-                    .inverse_action
-                    .as_deref()
-                    .map(|inverse| format!(" undo: {inverse}"))
-                    .unwrap_or_else(|| " not undoable".into());
+                let undo = action.action_history_undo_hint();
                 lines.push(format!(
                     "- {} {} via {:?};{}",
                     action.action, action.entity, action.origin, undo
@@ -3294,6 +3294,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn action_history_shows_undo_restore_hint_after_dim() {
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher =
+            ToolDispatcher::new(Some(Arc::new(RecordingHomeProvider::new(executed.clone()))));
+        let ctx = || ToolExecutionContext {
+            request_origin: RequestOrigin::Dashboard,
+            ..ToolExecutionContext::default()
+        };
+
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "turn_on"
+                        }),
+                    },
+                    ctx(),
+                )
+                .await
+                .success
+        );
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "set_brightness",
+                            "value": 30
+                        }),
+                    },
+                    ctx(),
+                )
+                .await
+                .success
+        );
+
+        let history = dispatcher
+            .execute(&ToolCall {
+                name: "action_history".into(),
+                arguments: serde_json::json!({}),
+            })
+            .await;
+
+        assert!(history.success);
+        assert!(history.output.contains("set_brightness kitchen light"));
+        assert!(history.output.contains("undo: set_brightness 100"));
+        assert!(!history.output.contains("not undoable"));
+    }
+
+    #[tokio::test]
     async fn home_undo_restores_prior_state_after_toggle() {
         let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = Arc::new(RecordingHomeProvider::new(executed.clone()));
@@ -3405,6 +3460,82 @@ mod tests {
         assert!(history.success);
         assert!(history.output.contains("turn_on kitchen light"));
         assert!(history.output.contains("undo: turn_off"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn home_undo_restores_brightness_after_audit_hydrate_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-dispatch-audit-undo-restart-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(RecordingHomeProvider::new(executed.clone()));
+        let ctx = || ToolExecutionContext {
+            request_origin: RequestOrigin::Dashboard,
+            ..ToolExecutionContext::default()
+        };
+
+        let dispatcher =
+            ToolDispatcher::new(Some(provider.clone())).with_actuation_audit_path(path.clone());
+
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "turn_on"
+                        }),
+                    },
+                    ctx(),
+                )
+                .await
+                .success
+        );
+        assert!(
+            dispatcher
+                .execute_with_context(
+                    &ToolCall {
+                        name: "home_control".into(),
+                        arguments: serde_json::json!({
+                            "entity": "kitchen light",
+                            "action": "set_brightness",
+                            "value": 30
+                        }),
+                    },
+                    ctx(),
+                )
+                .await
+                .success
+        );
+        assert_eq!(provider.brightness(), Some(77));
+
+        let executed_restart = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider_restart = Arc::new(RecordingHomeProvider::new(executed_restart.clone()));
+        let restarted = ToolDispatcher::new(Some(provider_restart.clone()))
+            .with_actuation_audit_path(path.clone());
+
+        let undo = restarted
+            .execute_with_context(
+                &ToolCall {
+                    name: "home_undo".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ctx(),
+            )
+            .await;
+
+        assert!(undo.success, "{}", undo.output);
+        assert!(undo.output.contains("Undid the last home action"));
+        assert_eq!(
+            *executed_restart.lock().unwrap(),
+            vec![HomeActionKind::SetBrightness]
+        );
+        assert_eq!(provider_restart.brightness(), Some(255));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4142,6 +4273,55 @@ mod tests {
         assert!(
             mem.search("Maya", 5).unwrap().is_empty(),
             "person-scoped row must be deleted under a verified context"
+        );
+    }
+
+    #[test]
+    fn memory_forget_accepts_topic_and_what_aliases() {
+        let db = std::env::temp_dir().join(format!(
+            "memory-forget-topic-alias-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let memory = crate::memory::Memory::open(&db).unwrap();
+        memory.store("preference", "User likes jazz music").unwrap();
+        memory.store("hobby", "User plays guitar").unwrap();
+        let dispatcher =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory)));
+
+        // Test with "topic" alias (same shape memory_recall accepts)
+        let result = dispatcher.exec_memory_forget(
+            &serde_json::json!({"topic": "jazz"}),
+            ToolExecutionContext::default(),
+        );
+        assert!(result.is_ok(), "memory_forget should accept 'topic' alias");
+
+        // Verify the memory was deleted
+        let mem = dispatcher.memory.as_ref().unwrap().lock().unwrap();
+        let search_result = mem.search("jazz", 5).unwrap();
+        assert!(
+            search_result.is_empty(),
+            "Memory with 'jazz' should be deleted"
+        );
+
+        // Test with "what" alias
+        let memory2 = crate::memory::Memory::open(&db).unwrap();
+        memory2.store("hobby2", "User plays piano").unwrap();
+        let dispatcher2 =
+            ToolDispatcher::new(None).with_memory(Arc::new(std::sync::Mutex::new(memory2)));
+
+        let result2 = dispatcher2.exec_memory_forget(
+            &serde_json::json!({"what": "piano"}),
+            ToolExecutionContext::default(),
+        );
+        assert!(result2.is_ok(), "memory_forget should accept 'what' alias");
+
+        // Verify the memory was deleted
+        let mem2 = dispatcher2.memory.as_ref().unwrap().lock().unwrap();
+        let search_result2 = mem2.search("piano", 5).unwrap();
+        assert!(
+            search_result2.is_empty(),
+            "Memory with 'piano' should be deleted"
         );
     }
 

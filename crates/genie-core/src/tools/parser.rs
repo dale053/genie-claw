@@ -88,15 +88,9 @@ fn normalize_single_key_tool_call(
         return None;
     }
 
-    let arguments = if nested.is_object() {
-        nested.clone()
-    } else {
-        serde_json::json!({})
-    };
-
     Some(ToolCall {
         name: tool_name.clone(),
-        arguments,
+        arguments: normalize_single_key_arguments(tool_name, nested),
     })
 }
 
@@ -151,15 +145,61 @@ fn normalize_single_key_tool_call_for_eval(value: serde_json::Value) -> Option<T
         return None;
     }
 
-    let arguments = if nested.is_object() {
-        nested.clone()
-    } else {
-        serde_json::json!({})
-    };
-
     Some(ToolCall {
         name: tool_name.clone(),
-        arguments,
+        arguments: normalize_single_key_arguments(tool_name, nested),
+    })
+}
+
+/// Map the nested value of a compact single-key tool call (`{tool: <value>}`)
+/// to a tool arguments object.
+///
+/// Small models emit two shapes: a nested **object**
+/// (`{"get_weather":{"location":"Denver"}}`) whose contents are the arguments
+/// verbatim, and a nested **scalar** (`{"get_weather":"Denver"}`) where the
+/// model inlined the tool's primary argument. The scalar shape previously
+/// collapsed to `{}`, silently dropping the value and forcing a misleading
+/// schema error or empty actuation (issue #438); route it to the tool's primary
+/// argument instead. Shapes that are neither object nor scalar (array/null) keep
+/// the previous empty-arguments behavior.
+fn normalize_single_key_arguments(
+    tool_name: &str,
+    nested: &serde_json::Value,
+) -> serde_json::Value {
+    if nested.is_object() {
+        return nested.clone();
+    }
+
+    if (nested.is_string() || nested.is_number() || nested.is_boolean())
+        && let Some(primary) = scalar_primary_arg(tool_name)
+    {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(primary.to_string(), nested.clone());
+        return serde_json::Value::Object(arguments);
+    }
+
+    serde_json::json!({})
+}
+
+/// The argument a scalar single-key tool call should populate, for tools whose
+/// schema has a single required scalar input (see `normalize_single_key_arguments`,
+/// issue #438). Each entry is the sole `required` field of that tool in
+/// `ToolDispatcher::tool_defs`; the `scalar_primary_arg_matches_tool_schema` test
+/// guards against drift. Tools with zero or multiple required fields (e.g.
+/// `home_control`, `get_time`) are intentionally absent — a lone scalar cannot
+/// unambiguously fill them, so they keep the empty-arguments fallback.
+fn scalar_primary_arg(tool_name: &str) -> Option<&'static str> {
+    Some(match tool_name {
+        "get_weather" => "location",
+        "web_search" => "query",
+        "calculate" => "expression",
+        "play_media" => "query",
+        "memory_recall" => "query",
+        "memory_store" => "content",
+        "memory_forget" => "query",
+        "home_status" => "entity",
+        "set_timer" => "seconds",
+        _ => return None,
     })
 }
 
@@ -301,6 +341,12 @@ fn extract_balanced_json_candidate(
                     if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
                         return Some(candidate.to_string());
                     }
+                    let repaired = strip_trailing_commas(candidate);
+                    if repaired != candidate
+                        && serde_json::from_str::<serde_json::Value>(&repaired).is_ok()
+                    {
+                        return Some(repaired);
+                    }
                     return None;
                 }
             }
@@ -309,6 +355,44 @@ fn extract_balanced_json_candidate(
     }
 
     None
+}
+
+fn strip_trailing_commas(json: &str) -> String {
+    let chars: Vec<char> = json.chars().collect();
+    let mut out = String::with_capacity(json.len());
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (index, &current) in chars.iter().enumerate() {
+        if escape {
+            out.push(current);
+            escape = false;
+            continue;
+        }
+
+        match current {
+            '\\' if in_string => {
+                out.push(current);
+                escape = true;
+            }
+            '"' => {
+                in_string = !in_string;
+                out.push(current);
+            }
+            ',' if !in_string => {
+                let mut next = index + 1;
+                while next < chars.len() && chars[next].is_whitespace() {
+                    next += 1;
+                }
+                if !(next < chars.len() && matches!(chars[next], '}' | ']')) {
+                    out.push(current);
+                }
+            }
+            _ => out.push(current),
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -433,6 +517,122 @@ mod tests {
     }
 
     #[test]
+    fn single_key_scalar_value_maps_to_primary_arg() {
+        let dispatcher = ToolDispatcher::new(None);
+        for (json, tool, arg, expected) in [
+            (
+                r#"{"get_weather":"Denver"}"#,
+                "get_weather",
+                "location",
+                "Denver",
+            ),
+            (
+                r#"{"calculate":"2 + 2"}"#,
+                "calculate",
+                "expression",
+                "2 + 2",
+            ),
+            (
+                r#"{"memory_recall":"Maya"}"#,
+                "memory_recall",
+                "query",
+                "Maya",
+            ),
+            (r#"{"play_media":"jazz"}"#, "play_media", "query", "jazz"),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(json).unwrap();
+            let call = normalize_single_key_tool_call(value, &dispatcher).unwrap();
+            assert_eq!(call.name, tool);
+            assert_eq!(call.arguments[arg], expected, "tool {tool}");
+        }
+    }
+
+    #[test]
+    fn single_key_scalar_number_maps_to_primary_arg() {
+        let dispatcher = ToolDispatcher::new(None);
+        let value = serde_json::json!({ "set_timer": 300 });
+        let call = normalize_single_key_tool_call(value, &dispatcher).unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 300);
+    }
+
+    #[test]
+    fn single_key_object_value_is_unchanged() {
+        // Regression: nested objects must still pass through verbatim.
+        let dispatcher = ToolDispatcher::new(None);
+        let value = serde_json::json!({ "get_weather": {"location": "Tokyo", "forecast": true} });
+        let call = normalize_single_key_tool_call(value, &dispatcher).unwrap();
+        assert_eq!(call.arguments["location"], "Tokyo");
+        assert_eq!(call.arguments["forecast"], true);
+    }
+
+    #[test]
+    fn single_key_scalar_without_primary_arg_stays_empty() {
+        // home_control has two required fields (entity, action): a lone scalar
+        // cannot fill it unambiguously, so arguments stay empty as before.
+        let dispatcher = ToolDispatcher::new(None);
+        if dispatcher
+            .tool_defs()
+            .iter()
+            .any(|t| t.name == "home_control")
+        {
+            let value = serde_json::json!({ "home_control": "kitchen light" });
+            let call = normalize_single_key_tool_call(value, &dispatcher).unwrap();
+            assert_eq!(call.name, "home_control");
+            assert_eq!(call.arguments, serde_json::json!({}));
+        }
+    }
+
+    #[test]
+    fn eval_parser_recovers_scalar_single_key_call() {
+        let calls = parse_tool_calls_for_eval(r#"{"web_search":"jetson power consumption"}"#);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].arguments["query"], "jetson power consumption");
+    }
+
+    #[test]
+    fn scalar_primary_arg_matches_tool_schema() {
+        // Drift guard: every mapped primary arg must be the tool's sole required
+        // field in its actual schema, so the table cannot silently diverge.
+        let dispatcher = ToolDispatcher::new(None);
+        for def in dispatcher.tool_defs() {
+            if let Some(primary) = scalar_primary_arg(&def.name) {
+                let required: Vec<&str> = def
+                    .parameters
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                assert_eq!(
+                    required,
+                    vec![primary],
+                    "scalar_primary_arg({}) must equal the tool's sole required field",
+                    def.name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn try_tool_call_recovers_scalar_single_key_calculate() {
+        // End-to-end: a compact scalar call now executes instead of failing
+        // schema validation with empty arguments (issue #438). `calculate` is
+        // always registered and needs no network or home automation.
+        let dispatcher = ToolDispatcher::new(None);
+        let result = try_tool_call(r#"{"calculate":"2 + 2"}"#, &dispatcher)
+            .await
+            .unwrap();
+        assert_eq!(result.tool, "calculate");
+        assert!(
+            result.success,
+            "scalar single-key calculate should execute, got: {}",
+            result.output
+        );
+        assert!(result.output.contains('4'), "output: {}", result.output);
+    }
+
+    #[test]
     fn eval_parser_accepts_json_array_tool_calls() {
         let input = r#"[{"tool": "get_time", "arguments": {}}, {"tool": "set_timer", "arguments": {"seconds": 60}}]"#;
         let calls = parse_tool_calls_for_eval(input);
@@ -457,6 +657,44 @@ mod tests {
         let calls = parse_tool_calls_for_eval(r#"{"answer":"hello"}"#);
 
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn extract_recovers_trailing_comma_object() {
+        let input = r#"{"tool":"set_timer","arguments":{"seconds":300},}"#;
+        let calls = parse_tool_calls_for_eval(input);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "set_timer");
+        assert_eq!(calls[0].arguments["seconds"], 300);
+    }
+
+    #[test]
+    fn extract_recovers_trailing_comma_array() {
+        let input = r#"[{"tool":"get_time","arguments":{}},{"tool":"set_timer","arguments":{"seconds":60}},]"#;
+        let calls = parse_tool_calls_for_eval(input);
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "get_time");
+        assert_eq!(calls[1].name, "set_timer");
+        assert_eq!(calls[1].arguments["seconds"], 60);
+    }
+
+    #[test]
+    fn extract_trailing_comma_recovery_preserves_string_commas() {
+        let input = r#"{"tool":"web_search","arguments":{"query":"a, b,}","limit":3},}"#;
+        let json = extract_json(input).unwrap();
+        let call: ToolCall = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(call.name, "web_search");
+        assert_eq!(call.arguments["query"], "a, b,}");
+        assert_eq!(call.arguments["limit"], 3);
+    }
+
+    #[test]
+    fn extract_leaves_valid_json_untouched() {
+        let input = r#"{"tool":"get_time","arguments":{}}"#;
+        assert_eq!(extract_json(input).unwrap(), input);
     }
 
     // The `system_info` tool reads /proc/meminfo (via tegrastats), /proc/uptime,
