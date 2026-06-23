@@ -1323,7 +1323,10 @@ async fn escalate_via_privacy_proxy(
             entries
                 .into_iter()
                 .filter(|e| crate::memory::policy::eligible_for_escalation(&e.kind, &e.content))
-                .map(|e| e.content)
+                .flat_map(|e| crate::memory::policy::extract_vocab_terms(&e.kind, &e.content))
+                .filter(|t| !t.is_empty())
+                .collect::<std::collections::HashSet<String>>()
+                .into_iter()
                 .collect(),
         )
     })
