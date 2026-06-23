@@ -8,6 +8,19 @@
   in both `voice`-on and `voice`-off builds. Rendering moved into a pure
   `usage_text()` helper with a regression test that fails if any command line
   loses its indent.
+- **Quick-router compound spoken durations** (#449): "set a timer for forty
+  five minutes" now sets a 45-minute timer instead of 5. The deterministic
+  router only ever saw single tokens, so its `"forty five"` number arm was dead
+  code and the trailing "five" bound to the unit. `parse_duration` now stitches
+  a tens word (`twenty`..`ninety`) to a following ones digit, and the missing
+  `fifty`..`ninety` tens words parse on their own.
+- **Tool-call parser tolerates trailing commas** (#469): a trailing comma (a
+  common local-model JSON quirk) made the embedded-JSON scanner return an inner
+  fragment of the call — `{"tool":"set_timer","arguments":{"seconds":300},}`
+  parsed as a phantom `"seconds"` tool, and array forms dropped every call after
+  the first. A balanced candidate that fails to parse is now retried once with a
+  string-aware trailing-comma strip, recovering the correct call for both the
+  runtime and BFCL eval paths.
 
 ## 1.0.0-alpha.11 - 2026-06-20
 
