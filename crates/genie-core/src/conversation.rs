@@ -215,6 +215,85 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Remove old conversation messages and trim long conversations.
+    ///
+    /// Two passes are run:
+    /// 1. Messages older than `retention_days` are deleted across all conversations
+    ///    (pass 0 to skip age-based pruning).
+    /// 2. Each conversation that exceeds `max_messages_per_conversation` has its
+    ///    oldest messages deleted until only the most recent N remain
+    ///    (pass 0 to skip per-conversation capping).
+    ///
+    /// After both passes, `PRAGMA wal_checkpoint(TRUNCATE)` is issued so the WAL
+    /// file is folded back into the main database and freed pages are returned
+    /// to the OS.
+    ///
+    /// Returns the total number of messages deleted.
+    pub fn prune_old_turns(
+        &self,
+        retention_days: u32,
+        max_messages_per_conversation: usize,
+    ) -> Result<usize> {
+        let mut deleted = 0usize;
+
+        if retention_days > 0 {
+            let cutoff_ms = now_ms() - (retention_days as i64 * 86_400_000);
+            deleted += self
+                .conn
+                .execute("DELETE FROM messages WHERE ts_ms < ?1", [cutoff_ms])?;
+            // Remove conversations that have no remaining messages.
+            self.conn.execute(
+                "DELETE FROM conversations \
+                 WHERE id NOT IN (SELECT DISTINCT conv_id FROM messages)",
+                [],
+            )?;
+        }
+
+        if max_messages_per_conversation > 0 {
+            let over_limit: Vec<String> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id FROM conversations \
+                     WHERE (SELECT COUNT(*) FROM messages WHERE conv_id = conversations.id) > ?1",
+                )?;
+                stmt.query_map([max_messages_per_conversation as i64], |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            };
+            for conv_id in &over_limit {
+                deleted += self.conn.execute(
+                    "DELETE FROM messages \
+                     WHERE conv_id = ?1 \
+                       AND id NOT IN ( \
+                           SELECT id FROM messages \
+                           WHERE conv_id = ?1 \
+                           ORDER BY ts_ms DESC, id DESC \
+                           LIMIT ?2 \
+                       )",
+                    rusqlite::params![conv_id, max_messages_per_conversation as i64],
+                )?;
+            }
+        }
+
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+        Ok(deleted)
+    }
+
+    /// Return the on-disk size of the conversation database in bytes, estimated
+    /// from SQLite's `PRAGMA page_count` × `PRAGMA page_size`.
+    pub fn db_size_bytes(&self) -> Option<u64> {
+        let pages: u64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .ok()?;
+        let page_size: u64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .ok()?;
+        Some(pages * page_size)
+    }
+
     /// Delete all conversations.
     pub fn clear_all(&self) -> Result<()> {
         self.conn.execute("DELETE FROM messages", [])?;
