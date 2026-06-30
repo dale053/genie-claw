@@ -651,9 +651,7 @@ mod tests {
     fn msg_contents(store: &ConversationStore, conv_id: &str) -> Vec<String> {
         let mut stmt = store
             .conn
-            .prepare(
-                "SELECT content FROM messages WHERE conv_id = ?1 ORDER BY ts_ms ASC, id ASC",
-            )
+            .prepare("SELECT content FROM messages WHERE conv_id = ?1 ORDER BY ts_ms ASC, id ASC")
             .unwrap();
         stmt.query_map([conv_id], |r| r.get(0))
             .unwrap()
@@ -705,16 +703,16 @@ mod tests {
         assert_eq!(deleted, 5);
 
         // conv_keep: only the recent message remains.
-        assert!(conv_exists(&store, &keep));
-        assert_eq!(msg_count(&store, &keep), 1);
-        assert_eq!(msg_contents(&store, &keep), vec!["recent"]);
+        assert!(conv_exists(&store, keep));
+        assert_eq!(msg_count(&store, keep), 1);
+        assert_eq!(msg_contents(&store, keep), vec!["recent"]);
 
         // conv_gone: removed entirely (no surviving messages).
-        assert!(!conv_exists(&store, &gone));
+        assert!(!conv_exists(&store, gone));
 
         // conv_cap: exactly the 3 newest messages (msg-2, msg-3, msg-4).
-        assert!(conv_exists(&store, &cap));
-        let remaining = msg_contents(&store, &cap);
+        assert!(conv_exists(&store, cap));
+        let remaining = msg_contents(&store, cap);
         assert_eq!(remaining, vec!["msg-2", "msg-3", "msg-4"]);
     }
 }
