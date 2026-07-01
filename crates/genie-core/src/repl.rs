@@ -62,7 +62,7 @@ pub async fn run(
         crate::security::injection::scan_and_warn(text, crate::security::injection::source::REPL);
 
         // Persist user message.
-        conversations.append_or_log(&conv_id, "user", text, None);
+        conversations.append_or_log(&conv_id, "user", text, None, None);
 
         if let Some(call) = tools::quick::route_for_available_tools(
             text,
@@ -91,14 +91,21 @@ pub async fn run(
             .to_string();
 
             eprintln!("\nGeniePod: {}", response);
-            conversations.append_or_log(&conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+            conversations.append_or_log(
+                &conv_id,
+                "assistant",
+                &tool_json,
+                Some(&tool_result.tool),
+                None,
+            );
             conversations.append_or_log(
                 &conv_id,
                 "system",
                 &format!("Tool: {}", tool_result.output),
                 None,
+                None,
             );
-            conversations.append_or_log(&conv_id, "assistant", &response, None);
+            conversations.append_or_log(&conv_id, "assistant", &response, None, None);
 
             let stored = with_shared_memory(memory, |memory| {
                 memory::extract::extract_and_store(memory, text)
@@ -167,11 +174,13 @@ pub async fn run(
                         "assistant",
                         &response,
                         Some(&tool_result.tool),
+                        None,
                     );
                     conversations.append_or_log(
                         &conv_id,
                         "system",
                         &format!("Tool: {}", tool_result.output),
+                        None,
                         None,
                     );
 
@@ -190,6 +199,7 @@ pub async fn run(
                             &conv_id,
                             "assistant",
                             &tool_result.output,
+                            None,
                             None,
                         );
                     } else {
@@ -217,13 +227,19 @@ pub async fn run(
                         {
                             Ok(summary) => {
                                 eprintln!();
-                                conversations.append_or_log(&conv_id, "assistant", &summary, None);
+                                conversations.append_or_log(
+                                    &conv_id,
+                                    "assistant",
+                                    &summary,
+                                    None,
+                                    None,
+                                );
                             }
                             Err(_) => eprintln!(),
                         }
                     }
                 } else {
-                    conversations.append_or_log(&conv_id, "assistant", &response, None);
+                    conversations.append_or_log(&conv_id, "assistant", &response, None, None);
                 }
             }
             Err(e) => {

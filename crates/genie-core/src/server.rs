@@ -903,7 +903,7 @@ async fn handle_chat_stream(
     };
 
     conversations.ensure(&conv_id, "New conversation")?;
-    conversations.append(&conv_id, "user", user_text, None)?;
+    conversations.append(&conv_id, "user", user_text, None, None)?;
 
     if let Some(call) = crate::tools::quick::route_for_available_tools(
         user_text,
@@ -1101,7 +1101,7 @@ async fn handle_chat_stream(
             state.pending.clear();
             state.emitted_text = true;
         }
-        conversations.append_or_log(&conv_id, "assistant", &sanitized, None);
+        conversations.append_or_log(&conv_id, "assistant", &sanitized, None, None);
         sanitized
     };
 
@@ -1138,7 +1138,7 @@ pub async fn process_chat_turn(
     privacy_proxy: Option<&PrivacyProxyConfig>,
 ) -> Result<ChatTurnResult> {
     conversations.ensure(conv_id, "New conversation")?;
-    conversations.append(conv_id, "user", user_text, None)?;
+    conversations.append(conv_id, "user", user_text, None, None)?;
 
     if let Some(call) = crate::tools::quick::route_for_available_tools(
         user_text,
@@ -1288,7 +1288,7 @@ pub async fn process_chat_turn(
         } else {
             crate::security::sandbox::sanitize_output(&llm_response)
         };
-        conversations.append_or_log(conv_id, "assistant", &sanitized, None);
+        conversations.append_or_log(conv_id, "assistant", &sanitized, None, None);
         sanitized
     };
 
@@ -1350,11 +1350,18 @@ fn finalize_direct_tool_turn(
         "arguments": call.arguments,
     })
     .to_string();
-    conversations.append_or_log(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+    conversations.append_or_log(
+        conv_id,
+        "assistant",
+        &tool_json,
+        Some(&tool_result.tool),
+        None,
+    );
     conversations.append_or_log(
         conv_id,
         "system",
         &format!("Tool result: {}", tool_result.output),
+        None,
         None,
     );
 
@@ -1364,7 +1371,7 @@ fn finalize_direct_tool_turn(
         format!("{} failed: {}", tool_result.tool, tool_result.output)
     };
     let sanitized = crate::security::sandbox::sanitize_output(&response);
-    conversations.append_or_log(conv_id, "assistant", &sanitized, None);
+    conversations.append_or_log(conv_id, "assistant", &sanitized, None, None);
     sanitized
 }
 
@@ -1376,11 +1383,18 @@ async fn finalize_tool_turn(
     tool_result: &crate::tools::ToolResult,
     model_family: ModelFamily,
 ) -> String {
-    conversations.append_or_log(conv_id, "assistant", llm_response, Some(&tool_result.tool));
+    conversations.append_or_log(
+        conv_id,
+        "assistant",
+        llm_response,
+        Some(&tool_result.tool),
+        None,
+    );
     conversations.append_or_log(
         conv_id,
         "system",
         &format!("Tool result: {}", tool_result.output),
+        None,
         None,
     );
 
@@ -1409,7 +1423,7 @@ async fn finalize_tool_turn(
     };
     let sanitized_summary = crate::security::sandbox::sanitize_output(&summary);
 
-    conversations.append_or_log(conv_id, "assistant", &sanitized_summary, None);
+    conversations.append_or_log(conv_id, "assistant", &sanitized_summary, None, None);
     sanitized_summary
 }
 

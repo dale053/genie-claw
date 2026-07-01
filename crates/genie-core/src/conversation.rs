@@ -54,6 +54,9 @@ impl ConversationStore {
             ",
         )?;
 
+        // Migrate existing databases: add speaker column if not present (#559).
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN speaker TEXT", []);
+
         Ok(Self { conn })
     }
 
@@ -85,11 +88,12 @@ impl ConversationStore {
         role: &str,
         content: &str,
         tool_name: Option<&str>,
+        speaker: Option<&str>,
     ) -> Result<()> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO messages (conv_id, role, content, tool_name, ts_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![conv_id, role, content, tool_name, now],
+            "INSERT INTO messages (conv_id, role, content, tool_name, ts_ms, speaker) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![conv_id, role, content, tool_name, now, speaker],
         )?;
 
         // Update conversation title from first user message.
@@ -127,8 +131,15 @@ impl ConversationStore {
     }
 
     /// Append a message, logging SQLite/IO failures instead of silently dropping them.
-    pub fn append_or_log(&self, conv_id: &str, role: &str, content: &str, tool_name: Option<&str>) {
-        if let Err(error) = self.append(conv_id, role, content, tool_name) {
+    pub fn append_or_log(
+        &self,
+        conv_id: &str,
+        role: &str,
+        content: &str,
+        tool_name: Option<&str>,
+        speaker: Option<&str>,
+    ) {
+        if let Err(error) = self.append(conv_id, role, content, tool_name, speaker) {
             tracing::error!(
                 conv_id,
                 role,
@@ -341,14 +352,14 @@ mod tests {
                 .unwrap(),
         };
         let error = store
-            .append(&conv_id, "assistant", "hello", None)
+            .append(&conv_id, "assistant", "hello", None, None)
             .unwrap_err();
         assert!(
             !error.to_string().is_empty(),
             "append should fail on readonly db: {error}"
         );
 
-        store.append_or_log(&conv_id, "assistant", "hello", None);
+        store.append_or_log(&conv_id, "assistant", "hello", None, None);
 
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o644);
@@ -361,8 +372,10 @@ mod tests {
         let store = temp_store();
         let id = store.create().unwrap();
 
-        store.append(&id, "user", "hello", None).unwrap();
-        store.append(&id, "assistant", "hi there!", None).unwrap();
+        store.append(&id, "user", "hello", None, None).unwrap();
+        store
+            .append(&id, "assistant", "hi there!", None, None)
+            .unwrap();
 
         let messages = store.get_messages(&id).unwrap();
         assert_eq!(messages.len(), 2);
@@ -377,7 +390,7 @@ mod tests {
         let id = store.create().unwrap();
 
         store
-            .append(&id, "user", "what's the weather in Tokyo?", None)
+            .append(&id, "user", "what's the weather in Tokyo?", None, None)
             .unwrap();
 
         let convos = store.list().unwrap();
@@ -391,7 +404,7 @@ mod tests {
 
         for i in 0..10 {
             store
-                .append(&id, "user", &format!("msg {}", i), None)
+                .append(&id, "user", &format!("msg {}", i), None, None)
                 .unwrap();
         }
 
@@ -405,7 +418,7 @@ mod tests {
     fn delete_conversation() {
         let store = temp_store();
         let id = store.create().unwrap();
-        store.append(&id, "user", "test", None).unwrap();
+        store.append(&id, "user", "test", None, None).unwrap();
 
         store.delete(&id).unwrap();
         assert_eq!(store.list().unwrap().len(), 0);
@@ -415,8 +428,8 @@ mod tests {
     fn export_json() {
         let store = temp_store();
         let id = store.create().unwrap();
-        store.append(&id, "user", "hello", None).unwrap();
-        store.append(&id, "assistant", "world", None).unwrap();
+        store.append(&id, "user", "hello", None, None).unwrap();
+        store.append(&id, "assistant", "world", None, None).unwrap();
 
         let json = store.export_json(&id).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -475,7 +488,7 @@ mod tests {
 
         let message = format!("I love coding! {}", "🎉".repeat(13));
         assert!(message.len() > 60, "test fixture must trigger the >60 path");
-        store.append(&id, "user", &message, None).unwrap();
+        store.append(&id, "user", &message, None, None).unwrap();
 
         let convos = store.list().unwrap();
         let title = &convos[0].title;
@@ -504,7 +517,7 @@ mod tests {
         // 31 × "й" = 62 bytes. Byte 57 is inside char 29 (0-indexed 28).
         let message = "й".repeat(31);
         assert!(message.len() > 60);
-        store.append(&id, "user", &message, None).unwrap();
+        store.append(&id, "user", &message, None, None).unwrap();
 
         let convos = store.list().unwrap();
         let title = &convos[0].title;
@@ -520,7 +533,9 @@ mod tests {
     fn append_title_short_message_used_verbatim() {
         let store = temp_store();
         let id = store.create().unwrap();
-        store.append(&id, "user", "set a timer", None).unwrap();
+        store
+            .append(&id, "user", "set a timer", None, None)
+            .unwrap();
         let convos = store.list().unwrap();
         assert_eq!(convos[0].title, "set a timer");
     }
@@ -532,7 +547,7 @@ mod tests {
         let store = temp_store();
         let id = store.create().unwrap();
         let message = "a".repeat(70);
-        store.append(&id, "user", &message, None).unwrap();
+        store.append(&id, "user", &message, None, None).unwrap();
         let convos = store.list().unwrap();
         assert_eq!(convos[0].title, format!("{}...", "a".repeat(57)));
     }

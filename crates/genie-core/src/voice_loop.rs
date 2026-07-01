@@ -364,6 +364,10 @@ async fn run_with_wakeword(
                                 },
                             );
                             let read_context = identity::build_memory_read_context(&text, &speaker);
+                            crate::security::audit::log_speaker_resolved(
+                                speaker.name.as_deref().unwrap_or("unknown"),
+                                &format!("{:?}", speaker.confidence),
+                            );
                             let _ = tokio::fs::remove_file(&followup_path).await;
 
                             if let VoiceIntentDecision::Reject(reason) =
@@ -383,7 +387,13 @@ async fn run_with_wakeword(
 
                             // Build context and process — reuse voice_cycle but skip recording
                             // (we already have the text).
-                            conversations.append_or_log(conv_id, "user", &text, None);
+                            conversations.append_or_log(
+                                conv_id,
+                                "user",
+                                &text,
+                                None,
+                                speaker.name.as_deref(),
+                            );
 
                             if handle_quick_tool_for_voice(
                                 tools,
@@ -442,6 +452,7 @@ async fn run_with_wakeword(
                                         conv_id,
                                         "assistant",
                                         &response,
+                                        None,
                                         None,
                                     );
                                     eprintln!("[voice] GeniePod: {}", format::for_voice(&response));
@@ -717,7 +728,7 @@ async fn handle_quick_tool_for_voice(
         };
         if let Some(rejected) = tools.gate_tool_call(&call, exec_ctx) {
             let response = crate::security::sandbox::sanitize_output(&rejected.output);
-            conversations.append_or_log(conv_id, "assistant", &response, None);
+            conversations.append_or_log(conv_id, "assistant", &response, None, None);
             let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
             let voice_text = format::for_voice(&response);
             if !voice_text.is_empty() {
@@ -734,7 +745,7 @@ async fn handle_quick_tool_for_voice(
                         crate::security::sandbox::sanitize_output(&format!("Tool error: {error}"));
                     let started = std::time::Instant::now();
                     tools.audit_gated_tool(&call, exec_ctx, started, false, &response);
-                    conversations.append_or_log(conv_id, "assistant", &response, None);
+                    conversations.append_or_log(conv_id, "assistant", &response, None, None);
                     let tts_engine =
                         tts_engine_for_language(voice_cfg, audio_device, response_language);
                     let voice_text = format::for_voice(&response);
@@ -765,9 +776,15 @@ async fn handle_quick_tool_for_voice(
         })
         .to_string();
 
-        conversations.append_or_log(conv_id, "assistant", &tool_json, Some("web_search"));
-        conversations.append_or_log(conv_id, "system", &format!("Tool: {}", response), None);
-        conversations.append_or_log(conv_id, "assistant", &response, None);
+        conversations.append_or_log(conv_id, "assistant", &tool_json, Some("web_search"), None);
+        conversations.append_or_log(
+            conv_id,
+            "system",
+            &format!("Tool: {}", response),
+            None,
+            None,
+        );
+        conversations.append_or_log(conv_id, "assistant", &response, None, None);
 
         let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
         let voice_text = format::for_voice(&voice_response);
@@ -800,14 +817,21 @@ async fn handle_quick_tool_for_voice(
     })
     .to_string();
 
-    conversations.append_or_log(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
+    conversations.append_or_log(
+        conv_id,
+        "assistant",
+        &tool_json,
+        Some(&tool_result.tool),
+        None,
+    );
     conversations.append_or_log(
         conv_id,
         "system",
         &format!("Tool: {}", tool_result.output),
         None,
+        None,
     );
-    conversations.append_or_log(conv_id, "assistant", &response, None);
+    conversations.append_or_log(conv_id, "assistant", &response, None, None);
 
     let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
     let voice_text = format::for_voice(&response);
@@ -1058,6 +1082,10 @@ pub async fn process_transcript(
             detected_language: response_language.as_deref(),
         });
     let read_context = identity::build_memory_read_context(&text, &speaker);
+    crate::security::audit::log_speaker_resolved(
+        speaker.name.as_deref().unwrap_or("unknown"),
+        &format!("{:?}", speaker.confidence),
+    );
     if let Some(path) = wav_path {
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -1069,7 +1097,7 @@ pub async fn process_transcript(
         "[voice] You said: \"{}\" (STT: {} ms)",
         text, transcript.duration_ms
     );
-    conversations.append_or_log(conv_id, "user", &text, None);
+    conversations.append_or_log(conv_id, "user", &text, None, speaker.name.as_deref());
 
     if let Some(final_response) = handle_quick_tool_for_voice(
         tools,
@@ -1190,11 +1218,18 @@ pub async fn process_transcript(
             "[voice] Tool: {} → {}",
             tool_result.tool, tool_result.output
         );
-        conversations.append_or_log(conv_id, "assistant", &response, Some(&tool_result.tool));
+        conversations.append_or_log(
+            conv_id,
+            "assistant",
+            &response,
+            Some(&tool_result.tool),
+            None,
+        );
         conversations.append_or_log(
             conv_id,
             "system",
             &format!("Tool: {}", tool_result.output),
+            None,
             None,
         );
 
@@ -1250,10 +1285,10 @@ pub async fn process_transcript(
             }
         };
 
-        conversations.append_or_log(conv_id, "assistant", &summary, None);
+        conversations.append_or_log(conv_id, "assistant", &summary, None, None);
         (summary, Some(tool_result.tool))
     } else {
-        conversations.append_or_log(conv_id, "assistant", &response, None);
+        conversations.append_or_log(conv_id, "assistant", &response, None, None);
         (response, None)
     };
 
