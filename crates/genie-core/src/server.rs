@@ -280,10 +280,13 @@ impl ChatServer {
                                 tracing::warn!(error = %e, "auto-prune: memory prune failed")
                             }
                         }
-                        let conv_result = pruner_ctx.conversations.prune_old_turns(
-                            pruner_ctx.storage_config.conversation_retention_days,
-                            pruner_ctx.storage_config.max_messages_per_conversation,
-                        );
+                        let conv_result = pruner_ctx
+                            .conversations
+                            .prune_old_turns(
+                                pruner_ctx.storage_config.conversation_retention_days,
+                                pruner_ctx.storage_config.max_messages_per_conversation,
+                            )
+                            .await;
                         match conv_result {
                             Ok(deleted) => {
                                 tracing::info!(deleted, "auto-prune: conversation messages removed")
@@ -1730,8 +1733,7 @@ async fn handle_health(
         )
     });
     let conv_count = conversations.list().await.map(|l| l.len()).unwrap_or(0);
-    let conv_count = conversations.list().map(|l| l.len()).unwrap_or(0);
-    let conversation_db_bytes = conversations.db_size_bytes().unwrap_or(0);
+    let conversation_db_bytes = conversations.db_size_bytes().await.unwrap_or(0);
     let mem_avail = genie_common::tegrastats::mem_available_mb().unwrap_or(0);
     let chat = chat_gate.snapshot();
     let runtime_contract = with_shared_memory(memory, |memory| {
