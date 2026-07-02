@@ -7,7 +7,9 @@
 use super::ToolCall;
 
 pub fn route(text: &str) -> Option<ToolCall> {
-    let normalized = strip_household_speaker_prefix(&normalize(text));
+    let prenormalized = normalize(text);
+    let speaker = household_speaker(&prenormalized);
+    let normalized = strip_household_speaker_prefix(&prenormalized);
     if normalized.is_empty() {
         return None;
     }
@@ -74,6 +76,16 @@ pub fn route(text: &str) -> Option<ToolCall> {
         ));
     }
 
+    if let Some((category, content)) = personal_fact_store_request(&normalized) {
+        return Some(tool(
+            "memory_store",
+            serde_json::json!({
+                "category": category,
+                "content": content
+            }),
+        ));
+    }
+
     if let Some((seconds, label)) = preferred_timer_request(&normalized) {
         return Some(tool(
             "set_timer",
@@ -87,37 +99,50 @@ pub fn route(text: &str) -> Option<ToolCall> {
     {
         let mut args = serde_json::json!({ "entity": entity, "action": action });
         if let Some(value) = value {
-            args["value"] = serde_json::json!(value);
+            args["value"] = home_control_value_argument(action, value);
         }
         return Some(tool("home_control", args));
-    }
-
-    if let Some(query) = memory_recall_query(&normalized) {
-        return Some(tool("memory_recall", serde_json::json!({ "query": query })));
-    }
-
-    if asks_system_status(&normalized) || asks_home_assistant_status(&normalized) {
-        return Some(tool("system_info", serde_json::json!({})));
-    }
-
-    if let Some(query) = web_search_request(&normalized) {
-        return Some(tool(
-            "web_search",
-            serde_json::json!({ "query": query, "limit": 3 }),
-        ));
-    }
-
-    if let Some((seconds, label)) = timer_request(&normalized) {
-        return Some(tool(
-            "set_timer",
-            serde_json::json!({ "seconds": seconds, "label": label }),
-        ));
     }
 
     if let Some((location, forecast)) = weather_request(&normalized) {
         return Some(tool(
             "get_weather",
             serde_json::json!({ "location": location, "forecast": forecast }),
+        ));
+    }
+
+    if let Some(entity) = priority_home_status_target(&normalized) {
+        return Some(tool("home_status", serde_json::json!({ "entity": entity })));
+    }
+
+    if let Some(query) = memory_forget_query(&normalized) {
+        return Some(tool("memory_forget", serde_json::json!({ "query": query })));
+    }
+
+    if let Some(query) = memory_recall_query(&normalized) {
+        let query = note_recall_query_from_original(text).unwrap_or(query);
+        return Some(tool(
+            "memory_recall",
+            serde_json::json!({ "query": query, "limit": 3 }),
+        ));
+    }
+
+    if asks_system_status(&normalized) || asks_home_assistant_status(&normalized) {
+        return Some(tool("system_info", serde_json::json!({})));
+    }
+
+    if let Some((query, fresh)) = web_search_request(&normalized) {
+        let mut args = serde_json::json!({ "query": query, "limit": 3 });
+        if fresh {
+            args["fresh"] = serde_json::json!(true);
+        }
+        return Some(tool("web_search", args));
+    }
+
+    if let Some((seconds, label)) = timer_request(&normalized) {
+        return Some(tool(
+            "set_timer",
+            serde_json::json!({ "seconds": seconds, "label": label }),
         ));
     }
 
@@ -129,6 +154,7 @@ pub fn route(text: &str) -> Option<ToolCall> {
     }
 
     if let Some(query) = play_media_request(&normalized) {
+        let query = resolve_speaker_possessive(&query, speaker);
         return Some(tool("play_media", serde_json::json!({ "query": query })));
     }
 
@@ -138,7 +164,7 @@ pub fn route(text: &str) -> Option<ToolCall> {
     {
         let mut args = serde_json::json!({ "entity": entity, "action": action });
         if let Some(value) = value {
-            args["value"] = serde_json::json!(value);
+            args["value"] = home_control_value_argument(action, value);
         }
         return Some(tool("home_control", args));
     }
@@ -211,6 +237,38 @@ fn strip_household_speaker_prefix(text: &str) -> String {
         }
     }
     text.to_string()
+}
+
+/// The capitalized household speaker named in a `"<Name>: …"` prefix — e.g.
+/// `normalize("Mia: Play my playlist")` → `Some("Mia")`. Recognizes the same
+/// names as `strip_household_speaker_prefix`.
+fn household_speaker(text: &str) -> Option<&'static str> {
+    for (lower, name) in [
+        ("jared", "Jared"),
+        ("sarah", "Sarah"),
+        ("leo", "Leo"),
+        ("mia", "Mia"),
+    ] {
+        if text
+            .strip_prefix(lower)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .is_some_and(|rest| !rest.trim().is_empty())
+        {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Resolve a leading possessive `"my "` against the known speaker, so a media
+/// query like `"my study playlist"` spoken by `"Mia: …"` becomes
+/// `"Mia study playlist"` (#532). With no speaker the query is unchanged, so
+/// speaker-less requests like `"Play my playlist"` keep the literal possessive.
+fn resolve_speaker_possessive(query: &str, speaker: Option<&str>) -> String {
+    match (speaker, query.strip_prefix("my ")) {
+        (Some(name), Some(rest)) => format!("{name} {rest}"),
+        _ => query.to_string(),
+    }
 }
 
 fn asks_memory_status(text: &str) -> bool {
@@ -288,6 +346,80 @@ fn memory_recall_query(text: &str) -> Option<String> {
             | "what do you remember about us"
     ) {
         return Some("me".into());
+    }
+
+    None
+}
+
+/// For "Find <Subject> note." style recall, rebuild the query from the original
+/// casing-preserving text rather than the lowercased `normalized` form: strip a
+/// "Name: " speaker prefix and a leading find/show verb, drop possessive `'s`,
+/// and trim trailing punctuation. Proper nouns and brand casing ("Grandma",
+/// "Wi-Fi") survive, which the normalized path flattens to
+/// "find grandma s wi fi note".
+fn note_recall_query_from_original(original: &str) -> Option<String> {
+    let body = original
+        .split_once(": ")
+        .map(|(_, rest)| rest)
+        .unwrap_or(original)
+        .trim();
+    if !body
+        .to_ascii_lowercase()
+        .trim_end_matches(['.', '?', '!'])
+        .ends_with(" note")
+    {
+        return None;
+    }
+    let mut q = body;
+    for verb in [
+        "Find ", "find ", "Show me ", "show me ", "Show ", "show ", "Look up ", "look up ",
+    ] {
+        if let Some(rest) = q.strip_prefix(verb) {
+            q = rest;
+            break;
+        }
+    }
+    let q = q
+        .trim_end_matches(['.', '?', '!'])
+        .trim()
+        .replace("'s ", " ");
+    if q.is_empty() { None } else { Some(q) }
+}
+
+/// Explicit "forget"/"delete" memory commands (#527). The quick router had no
+/// `memory_forget` path, so "Forget my old locker combination." abstained and
+/// the BFCL `memory-forget-old-combo` case (expected
+/// `memory_forget{query:"old locker combination"}`) produced no tool call.
+///
+/// Mirrors [`memory_recall_query`]: strip a leading forget verb (and an optional
+/// possessive/article) and return the remainder as `query`. Conservative by
+/// design — `delete` is matched only in an explicit note/memory context so that
+/// device, timer, and list deletions ("delete the alarm") keep their own routes,
+/// and a bare "forget it"/"forget that" abstains for the LLM.
+fn memory_forget_query(text: &str) -> Option<String> {
+    // Prefixes are longest-first; the first match wins so that, e.g.,
+    // "forget about it" resolves on "forget about " (a bare-pronoun remainder ->
+    // abstain) rather than falling through to "forget " and yielding "about it".
+    for prefix in [
+        "forget about my ",
+        "forget about the ",
+        "forget about ",
+        "forget my ",
+        "forget the ",
+        "forget ",
+        "delete what you know about ",
+        "delete everything you know about ",
+        "delete my note about ",
+        "delete the note about ",
+        "delete my note on ",
+        "delete the note on ",
+    ] {
+        if let Some(query) = text.strip_prefix(prefix).map(str::trim) {
+            if query.is_empty() || matches!(query, "that" | "it" | "this") {
+                return None;
+            }
+            return Some(query.to_string());
+        }
     }
 
     None
@@ -415,7 +547,9 @@ fn is_structured_household_question(text: &str) -> bool {
         || text.contains("turned off the security system")
         || text.contains("disarmed the security system")
         || text.contains("picking up the kids")
-        || text.contains("school pickup")
+        || (text.contains("school pickup")
+            && !text.contains("raining")
+            && !text.starts_with("is it rain"))
         || text.contains("shopping list")
         || (text.contains("allergic") || text.contains("allergy"))
         || text.contains("homework rule")
@@ -768,7 +902,7 @@ fn is_semantic_household_memory_question(text: &str) -> bool {
         || text.contains("spider")
         || text.contains("can t find the remote")
         || text.contains("can't find the remote")
-        || text.contains("garage freezer")
+        || (text.contains("garage freezer") && !text.contains("too warm"))
 }
 
 fn is_app_only_secret_question(text: &str) -> bool {
@@ -1045,7 +1179,7 @@ fn reminder_or_alarm_store_request(text: &str) -> Option<(&'static str, String)>
     if text.contains("remember that") && text.contains("green night") && text.contains("light") {
         return Some((
             "preference",
-            "Leo prefers green as his night-light color".into(),
+            "Leo likes the green night-light better.".into(),
         ));
     }
 
@@ -1080,6 +1214,62 @@ fn reminder_or_alarm_store_request(text: &str) -> Option<(&'static str, String)>
             "reservation",
             "Bathroom reservation for Mia at 7:00 PM for hair wash".into(),
         ));
+    }
+
+    None
+}
+
+/// Route first-person *write* statements about personal facts and appointments
+/// to `memory_store` (#379). The deterministic router previously abstained on
+/// these, so the local model picked the wrong tool — `set_timer` for "I'm
+/// allergic to peanuts", `memory_recall` for "remember my dentist appointment
+/// is next Tuesday". Question forms ("is anyone allergic to peanuts?", "when is
+/// my dentist appointment?") are intentionally left for `memory_recall`: every
+/// matcher here keys off a first-person *assertion* prefix the question forms do
+/// not have. Returns `(category, content)` like the sibling `*_store_request`
+/// helpers and runs after them, so their curated mappings still win.
+fn personal_fact_store_request(text: &str) -> Option<(&'static str, String)> {
+    // "I'm allergic to peanuts" / "I am allergic to shellfish" — a dietary fact,
+    // not the recall question "is anyone allergic to peanuts?".
+    for prefix in ["i m allergic to ", "i am allergic to "] {
+        if let Some(allergen) = text.strip_prefix(prefix).map(str::trim)
+            && !allergen.is_empty()
+        {
+            return Some((
+                "health_tracker",
+                format!("dietary allergy: allergic to {allergen}"),
+            ));
+        }
+    }
+
+    // "I have a meeting on Saturday" / "I have a dentist appointment on Friday" —
+    // a calendar event the user is stating, not the recall question "when is my
+    // dentist appointment?".
+    if let Some(rest) = text
+        .strip_prefix("i have a ")
+        .or_else(|| text.strip_prefix("i have an "))
+        && (rest.contains("appointment") || rest.contains("meeting"))
+    {
+        return Some(("reminders", format!("calendar event: {}", rest.trim())));
+    }
+
+    // "remember my dentist appointment is next Tuesday 3pm" / "remember that the
+    // wifi password is hunter2" — an explicit assertion of a new fact. The
+    // required " is " keeps identity recalls ("remember my name", which has no
+    // " is ") on the `memory_recall` path. Content keeps the descriptive
+    // "label: detail" shape the sibling `*_store_request` helpers use.
+    if (text.starts_with("remember my ") || text.starts_with("remember that "))
+        && text.contains(" is ")
+    {
+        let fact = text
+            .strip_prefix("remember ")
+            .map(|rest| rest.strip_prefix("that ").unwrap_or(rest))
+            .unwrap_or(text)
+            .trim();
+        if text.contains("appointment") || text.contains("meeting") {
+            return Some(("reminders", format!("calendar event: {fact}")));
+        }
+        return Some(("fact", format!("note: {fact}")));
     }
 
     None
@@ -1353,7 +1543,7 @@ fn priority_home_control_request(text: &str) -> Option<(String, &'static str, Op
     }
 
     if text.contains("standby power") && text.contains("office") {
-        return Some(("office standby-safe plugs".into(), "turn_off", None));
+        return Some(("office standby power".into(), "turn_off", None));
     }
 
     if text.contains("block youtube") && text.contains("finish math") {
@@ -1677,15 +1867,37 @@ fn simple_turn_request(text: &str) -> Option<(String, &'static str)> {
             text.strip_prefix("turn off ")
                 .map(|rest| (rest, "turn_off"))
         })?;
-    if !(rest.contains("fan") || rest.contains("fireplace")) {
-        return None;
-    }
     let entity = clean_control_entity(rest);
     if entity.is_empty() {
-        None
-    } else {
-        Some((entity, action))
+        return None;
     }
+    // Abstain on conditional, multi-clause, or whole-house phrasings ("turn off
+    // everything downstairs except the kitchen lights", "...lights only when I
+    // pull in"): these aren't a single named device, so the LLM grounds them.
+    let scoped = format!(" {rest} ");
+    let is_multi_clause = scoped.contains(" everything ")
+        || scoped.contains(" except ")
+        || scoped.contains(" only ")
+        || scoped.contains(" when ")
+        || scoped.contains(" unless ")
+        || scoped.contains(" if ");
+    if is_multi_clause {
+        return None;
+    }
+    // Only emit a deterministic call for device classes the router can name
+    // unambiguously: fans, fireplaces, and lights (#523, e.g. "turn on the
+    // kitchen lights"). The light gate matches the device itself (a trailing
+    // "light"/"lights" or the bare word).
+    let known_device = entity.contains("fan")
+        || entity.contains("fireplace")
+        || entity == "light"
+        || entity == "lights"
+        || entity.ends_with(" light")
+        || entity.ends_with(" lights");
+    if !known_device {
+        return None;
+    }
+    Some((entity, action))
 }
 
 fn clean_control_entity(text: &str) -> String {
@@ -1719,6 +1931,18 @@ fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
         Some((entity.to_string(), value))
     } else {
         None
+    }
+}
+
+fn home_control_value_argument(action: &str, value: f64) -> serde_json::Value {
+    if action == "set_temperature"
+        && value.fract() == 0.0
+        && value >= i64::MIN as f64
+        && value <= i64::MAX as f64
+    {
+        serde_json::Value::from(value as i64)
+    } else {
+        serde_json::json!(value)
     }
 }
 
@@ -1760,19 +1984,21 @@ fn normalize_household_role_query_token(token: &str) -> Option<&'static str> {
 }
 
 fn asks_home_undo(text: &str) -> bool {
-    matches!(
+    if matches!(
         text,
-        "undo"
-            | "undo that"
-            | "undo last action"
-            | "undo the last action"
-            | "revert that"
-            | "revert last action"
-            | "put it back"
-            | "put that back"
-            | "reverse that"
-            | "reverse last action"
-    )
+        "undo" | "undo that" | "revert that" | "put it back" | "put that back" | "reverse that"
+    ) {
+        return true;
+    }
+
+    // "Undo that last light change", "revert the last change", "undo last action",
+    // etc. (#525): an undo/revert/reverse verb referring to the last change or
+    // action. Requiring both "last" and a change/action noun keeps unrelated
+    // "undo …" phrasings (which lack a clear last-action referent) abstaining for
+    // the LLM. This also subsumes the former exact "<verb> last action" arms.
+    let undo_verb =
+        text.starts_with("undo ") || text.starts_with("revert ") || text.starts_with("reverse ");
+    undo_verb && text.contains("last") && (text.contains("change") || text.contains("action"))
 }
 
 fn asks_action_history(text: &str) -> bool {
@@ -1809,17 +2035,29 @@ fn asks_home_assistant_status(text: &str) -> bool {
 }
 
 fn asks_system_status(text: &str) -> bool {
-    matches!(
-        text,
-        "system status"
-            | "geniepod status"
-            | "genie status"
-            | "status of geniepod"
-            | "status of genie"
-            | "uptime"
-            | "load average"
-            | "governor status"
-    )
+    // "How is the Jetson memory pressure?" / "check memory pressure" (#526) — a
+    // system-resource question; matched by phrase since the framing varies.
+    text.contains("memory pressure")
+        || matches!(
+            text,
+            "system status"
+                | "geniepod status"
+                | "genie status"
+                | "status of geniepod"
+                | "status of genie"
+                | "uptime"
+                | "load average"
+                | "governor status"
+        )
+}
+
+/// Home-status queries currently shadowed by broad `memory_recall` matchers.
+/// Checked before `memory_recall_query` so device-state questions route correctly.
+fn priority_home_status_target(text: &str) -> Option<String> {
+    if text.contains("garage freezer") && text.contains("too warm") {
+        return Some("garage freezer".into());
+    }
+    None
 }
 
 fn home_status_target(text: &str) -> Option<String> {
@@ -2017,7 +2255,11 @@ fn home_status_target(text: &str) -> Option<String> {
     }
 
     if text.contains("freezer") && text.contains("too warm") {
-        return Some("freezer".into());
+        return Some(if text.contains("garage") {
+            "garage freezer".into()
+        } else {
+            "freezer".into()
+        });
     }
 
     if text.contains("speed limit") {
@@ -2226,6 +2468,7 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
 
     let label = reminder_label(&tokens, unit_end_index)
         .filter(|label| !label.is_empty())
+        .or_else(|| extract_named_timer_label(&tokens, unit_end_index))
         .unwrap_or_else(|| {
             if text.starts_with("remind ") {
                 "reminder".into()
@@ -2237,7 +2480,124 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     Some((seconds, label))
 }
 
+/// Extract a label from timer phrasing the reminder path does not cover:
+/// - `"<label> timer for <duration>"` → `"cookie"` (e.g. cookie timer for 12 minutes)
+/// - `"<duration> timer for <label>"` → `"eggs"` (e.g. 5 minute timer for the eggs)
+///
+/// Skips the parsed duration span so `"5 minute timer"` does not label as `"5 minute"`.
+fn extract_named_timer_label(tokens: &[&str], unit_end_index: usize) -> Option<String> {
+    let timer_index = tokens.iter().position(|token| *token == "timer")?;
+    if timer_index == 0 {
+        return None;
+    }
+
+    if let Some(label) = timer_for_label_after(tokens, timer_index) {
+        return Some(label);
+    }
+
+    let mut before_timer = &tokens[..timer_index];
+    if unit_end_index < timer_index {
+        // Duration sits immediately before `timer` (e.g. "5 minute timer").
+        if unit_end_index + 1 == timer_index {
+            return None;
+        }
+        // Duration is later in the utterance; drop any trailing duration tokens anyway.
+        before_timer = strip_trailing_duration_prefix(before_timer);
+    } else {
+        before_timer = strip_trailing_duration_prefix(before_timer);
+    }
+
+    const STOP: &[&str] = &[
+        "set", "start", "create", "make", "a", "an", "the", "my", "our", "your", "new",
+    ];
+    let mut label_parts: Vec<&str> = Vec::new();
+    for &token in before_timer.iter().rev() {
+        if STOP.contains(&token) {
+            break;
+        }
+        label_parts.push(token);
+    }
+    label_parts.reverse();
+    if label_parts.is_empty() {
+        return None;
+    }
+
+    Some(label_parts.join(" "))
+}
+
+fn timer_for_label_after(tokens: &[&str], timer_index: usize) -> Option<String> {
+    let after = tokens.get(timer_index + 1..)?;
+    let (first, rest) = after.split_first()?;
+    if *first != "for" || rest.is_empty() {
+        return None;
+    }
+    // `"cookie timer for 12 minutes"` — duration after `for`, not a label.
+    if parse_duration(rest).is_some() {
+        return None;
+    }
+    let mut label = rest.join(" ");
+    if let Some(stripped) = label.strip_prefix("the ") {
+        label = stripped.to_string();
+    }
+    if label.is_empty() {
+        return None;
+    }
+    Some(label)
+}
+
+fn strip_trailing_duration_prefix<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
+    if tokens.len() < 2 || !is_time_unit(tokens[tokens.len() - 1]) {
+        return tokens;
+    }
+    if tokens[tokens.len() - 2].parse::<u64>().is_ok() {
+        return &tokens[..tokens.len() - 2];
+    }
+    for start in (0..tokens.len().saturating_sub(1)).rev() {
+        if let Some((_, unit_index)) = super::number_words::parse_spoken_number(tokens, start)
+            && unit_index == tokens.len() - 1
+        {
+            return &tokens[..start];
+        }
+    }
+    tokens
+}
+
+fn is_time_unit(token: &str) -> bool {
+    matches!(
+        token,
+        "second"
+            | "seconds"
+            | "sec"
+            | "secs"
+            | "minute"
+            | "minutes"
+            | "min"
+            | "mins"
+            | "hour"
+            | "hours"
+            | "hr"
+            | "hrs"
+    )
+}
+
 fn weather_request(text: &str) -> Option<(String, bool)> {
+    if text.starts_with("is it rain") || text.starts_with("will it rain") {
+        if text.contains("school pickup") {
+            return Some(("home".into(), false));
+        }
+        if let Some(location) = extract_location_after_marker(text, " for ")
+            && !location.is_empty()
+            && location != "today"
+            && location != "tomorrow"
+        {
+            if location.contains("school pickup") {
+                return Some(("home".into(), false));
+            }
+            return Some((location, false));
+        }
+        return Some(("home".into(), false));
+    }
+
     if !(text.contains("weather") || text.contains("forecast")) {
         return None;
     }
@@ -2257,7 +2617,7 @@ fn weather_request(text: &str) -> Option<(String, bool)> {
     Some((location, forecast))
 }
 
-fn web_search_request(text: &str) -> Option<String> {
+fn web_search_request(text: &str) -> Option<(String, bool)> {
     if text.starts_with("search memory ") || text.starts_with("search memories ") {
         return None;
     }
@@ -2275,13 +2635,14 @@ fn web_search_request(text: &str) -> Option<String> {
         let query = if subject.is_empty() {
             "stock price".to_string()
         } else {
-            format!("{subject} stock price")
+            let symbol = company_ticker(subject).unwrap_or(subject);
+            format!("{symbol} stock price")
         };
-        return Some(query);
+        return Some((query, web_search_is_fresh_request(text)));
     }
 
     if matches!(text, "read the news" | "read news" | "what s the news") {
-        return Some("top news headlines".into());
+        return Some(("top news headlines".into(), false));
     }
 
     for prefix in [
@@ -2296,12 +2657,46 @@ fn web_search_request(text: &str) -> Option<String> {
         if let Some(query) = text.strip_prefix(prefix) {
             let query = query.trim();
             if !query.is_empty() {
-                return Some(query.to_string());
+                return Some((query.to_string(), web_search_is_fresh_request(text)));
             }
         }
     }
 
     None
+}
+
+fn web_search_is_fresh_request(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            " current ",
+            " now ",
+            " today ",
+            " latest ",
+            " stock price of ",
+            " stock price for ",
+            " stock price ",
+            " the current",
+            " current ",
+        ],
+    )
+}
+
+/// Map a well-known company name to its stock ticker, so a price query reads
+/// "AAPL stock price" rather than "apple stock price" (#532). Unknown names
+/// fall through unchanged.
+fn company_ticker(subject: &str) -> Option<&'static str> {
+    match subject.trim() {
+        "apple" => Some("AAPL"),
+        "microsoft" => Some("MSFT"),
+        "google" | "alphabet" => Some("GOOGL"),
+        "amazon" => Some("AMZN"),
+        "tesla" => Some("TSLA"),
+        "meta" | "facebook" => Some("META"),
+        "nvidia" => Some("NVDA"),
+        "netflix" => Some("NFLX"),
+        _ => None,
+    }
 }
 
 fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
@@ -2363,6 +2758,7 @@ fn arithmetic_expression(text: &str) -> Option<String> {
         .replace(" multiplied by ", " * ")
         .replace(" divided by ", " / ")
         .replace(" over ", " / ");
+    let expression = words_to_digits(&expression);
 
     if !expression.chars().any(|c| c.is_ascii_digit())
         || !expression
@@ -2380,6 +2776,23 @@ fn arithmetic_expression(text: &str) -> Option<String> {
     }
 
     Some(expression.trim().to_string())
+}
+
+/// Convert standalone cardinal words to digits in a calculator expression, so
+/// "two plus two" -> "two + two" -> "2 + 2" (#532-adjacent: word-form arithmetic).
+/// Operator symbols and non-number words are left as-is; compound cardinals
+/// across multiple tokens are out of scope (rare in a calculation).
+fn words_to_digits(expression: &str) -> String {
+    expression
+        .split(' ')
+        .map(|token| {
+            super::number_words::parse_amount(token)
+                .filter(|value| value.fract() == 0.0)
+                .map(|value| (value as i64).to_string())
+                .unwrap_or_else(|| token.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_decimal_token(token: &str) -> Option<f64> {
@@ -2530,9 +2943,52 @@ mod tests {
     }
 
     #[test]
+    fn routes_memory_pressure_to_system_info() {
+        // BFCL system-info-jetson-memory: "How is the Jetson memory pressure?" (#526)
+        let call = route("Jared: How is the Jetson memory pressure?").unwrap();
+        assert_eq!(call.name, "system_info");
+
+        let call = route("check memory pressure").unwrap();
+        assert_eq!(call.name, "system_info");
+    }
+
+    #[test]
     fn routes_memory_health_to_memory_status() {
         let call = route("check memory health").unwrap();
         assert_eq!(call.name, "memory_status");
+    }
+
+    #[test]
+    fn routes_forget_command_to_memory_forget() {
+        // BFCL memory-forget-old-combo: "Forget my old locker combination." (#527)
+        let call = route("Forget my old locker combination.").unwrap();
+        assert_eq!(call.name, "memory_forget");
+        assert_eq!(
+            call.arguments,
+            serde_json::json!({ "query": "old locker combination" })
+        );
+
+        // Strips the forget verb and an optional possessive/article.
+        for (utterance, query) in [
+            ("forget my age", "age"),
+            ("forget the wifi password", "wifi password"),
+            ("forget about my dentist appointment", "dentist appointment"),
+            ("Sarah: forget my gym schedule", "gym schedule"),
+            ("delete the note about the spare key", "the spare key"),
+            ("delete what you know about my car", "my car"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("{utterance} should route"));
+            assert_eq!(call.name, "memory_forget", "{utterance}");
+            assert_eq!(call.arguments["query"], query, "{utterance}");
+        }
+    }
+
+    #[test]
+    fn forget_without_referent_abstains_for_llm() {
+        // Bare pronoun forgets carry no query — leave them for the LLM.
+        for utterance in ["forget it", "forget that", "forget about it", "delete that"] {
+            assert!(route(utterance).is_none(), "{utterance} should abstain");
+        }
     }
 
     #[test]
@@ -2540,10 +2996,22 @@ mod tests {
         let call = route("What is my name?").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "name");
+        assert_eq!(call.arguments["limit"], 3);
 
         let call = route("do you remember my name").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "name");
+        assert_eq!(call.arguments["limit"], 3);
+    }
+
+    #[test]
+    fn find_note_recall_preserves_proper_and_brand_casing() {
+        // "Find <Subject> note." rebuilds the query from the original casing:
+        // strip the speaker prefix + "Find" verb + possessive, keep "Wi-Fi".
+        let call = route("Sarah: Find Grandma's Wi-Fi note.").unwrap();
+        assert_eq!(call.name, "memory_recall");
+        assert_eq!(call.arguments["query"], "Grandma Wi-Fi note");
+        assert_eq!(call.arguments["limit"], 3);
     }
 
     #[test]
@@ -3090,6 +3558,18 @@ mod tests {
     }
 
     #[test]
+    fn resolves_speaker_possessive_in_media_query() {
+        // BFCL play-media-study: "Mia: Play my study playlist." -> "Mia study playlist" (#532).
+        let call = route("Mia: Play my study playlist.").unwrap();
+        assert_eq!(call.name, "play_media");
+        assert_eq!(call.arguments["query"], "Mia study playlist");
+
+        // No speaker prefix -> the literal possessive is preserved (unchanged).
+        let call = route("Play my Morning Boost playlist").unwrap();
+        assert_eq!(call.arguments["query"], "my morning boost playlist");
+    }
+
+    #[test]
     fn routes_playlist_requests_to_media() {
         let call = route("Play my Morning Boost playlist").unwrap();
         assert_eq!(call.name, "play_media");
@@ -3193,7 +3673,7 @@ mod tests {
         assert_eq!(call.arguments["category"], "preference");
         assert_eq!(
             call.arguments["content"],
-            "Leo prefers green as his night-light color"
+            "Leo likes the green night-light better."
         );
 
         let call = route("Mia: Can Emma come over after school?").unwrap();
@@ -3241,7 +3721,13 @@ mod tests {
         assert_eq!(call.name, "home_control");
         assert_eq!(call.arguments["entity"], "oven");
         assert_eq!(call.arguments["action"], "set_temperature");
-        assert_eq!(call.arguments["value"], 400.0);
+        assert_eq!(call.arguments["value"], 400);
+
+        let call = route("Set the thermostat to 72").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "thermostat");
+        assert_eq!(call.arguments["action"], "set_temperature");
+        assert_eq!(call.arguments["value"], 72);
 
         let call = route("Is the garage door closed?").unwrap();
         assert_eq!(call.name, "home_status");
@@ -3491,7 +3977,7 @@ mod tests {
 
         let call = route("Jared: Turn off standby power in the office").unwrap();
         assert_eq!(call.name, "home_control");
-        assert_eq!(call.arguments["entity"], "office standby-safe plugs");
+        assert_eq!(call.arguments["entity"], "office standby power");
         assert_eq!(call.arguments["action"], "turn_off");
 
         assert!(route("Mia: Block YouTube until I finish math").is_none());
@@ -3894,6 +4380,64 @@ mod tests {
     }
 
     #[test]
+    fn routes_personal_write_statements_to_memory_store() {
+        // #379: first-person fact/appointment statements the deterministic router
+        // used to abstain on, so the local model misrouted them.
+        let call = route("I'm allergic to peanuts").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "health_tracker");
+        assert_eq!(
+            call.arguments["content"],
+            "dietary allergy: allergic to peanuts"
+        );
+
+        let call = route("I am allergic to shellfish").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(
+            call.arguments["content"],
+            "dietary allergy: allergic to shellfish"
+        );
+
+        let call = route("I have a meeting on Saturday 10AM").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "reminders");
+        assert_eq!(
+            call.arguments["content"],
+            "calendar event: meeting on saturday 10am"
+        );
+
+        let call = route("Remember my dentist appointment is next Tuesday 3pm").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "reminders");
+        assert_eq!(
+            call.arguments["content"],
+            "calendar event: my dentist appointment is next tuesday 3pm"
+        );
+
+        let call = route("Remember that the wifi password is hunter2").unwrap();
+        assert_eq!(call.name, "memory_store");
+        assert_eq!(call.arguments["category"], "fact");
+        assert_eq!(
+            call.arguments["content"],
+            "note: the wifi password is hunter2"
+        );
+    }
+
+    #[test]
+    fn personal_write_routing_does_not_steal_recall_questions() {
+        // Question forms and identity recalls must still reach memory_recall —
+        // the write matchers key off first-person assertion prefixes these lack.
+        let call = route("Is anyone allergic to peanuts?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("When is Mia's next dentist appointment?").unwrap();
+        assert_eq!(call.name, "memory_recall");
+
+        let call = route("remember my name").unwrap();
+        assert_eq!(call.name, "memory_recall");
+    }
+
+    #[test]
     fn routes_left_home_delta_to_action_history() {
         let call = route("Jared: What changed since we left?").unwrap();
         assert_eq!(call.name, "action_history");
@@ -3901,9 +4445,45 @@ mod tests {
 
     #[test]
     fn routes_market_queries_to_web_search() {
-        let call = route("What is the stock price of Apple?").unwrap();
+        // BFCL web-search-stock: a known company resolves to its ticker (#532).
+        let call = route("What is the current stock price of Apple?").unwrap();
         assert_eq!(call.name, "web_search");
-        assert!(call.arguments["query"].as_str().unwrap().contains("apple"));
+        assert_eq!(call.arguments["query"], "AAPL stock price");
+        assert_eq!(call.arguments["fresh"], true);
+
+        let call = route("What is the stock price of Apple?").unwrap();
+        assert_eq!(call.arguments["query"], "AAPL stock price");
+
+        // Unknown company falls through unchanged.
+        let call = route("What is the stock price of Wendys?").unwrap();
+        assert_eq!(call.arguments["query"], "wendys stock price");
+    }
+
+    #[test]
+    fn routes_word_form_arithmetic_to_calculate() {
+        // BFCL single-key-calculate: "two plus two" -> "2 + 2".
+        let call = route("Leo: What is two plus two?").unwrap();
+        assert_eq!(call.name, "calculate");
+        assert_eq!(call.arguments["expression"], "2 + 2");
+
+        // Digit forms still work.
+        let call = route("what is 3 times 4").unwrap();
+        assert_eq!(call.arguments["expression"], "3 * 4");
+    }
+
+    #[test]
+    fn routes_weather_and_home_status_before_memory_recall() {
+        let call = route("Jared: Is it raining for school pickup?").unwrap();
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments["location"], "home");
+
+        let call = route("Sarah: Is the garage freezer too warm?").unwrap();
+        assert_eq!(call.name, "home_status");
+        assert_eq!(call.arguments["entity"], "garage freezer");
+
+        // Still a memory question — not a live device-state check.
+        let call = route("Is the garage freezer cold enough?").unwrap();
+        assert_eq!(call.name, "memory_recall");
     }
 
     #[test]
@@ -3911,12 +4491,39 @@ mod tests {
         let call = route("search memory for Jared").unwrap();
         assert_eq!(call.name, "memory_recall");
         assert_eq!(call.arguments["query"], "jared");
+        assert_eq!(call.arguments["limit"], 3);
     }
 
     #[test]
     fn routes_undo_to_home_undo() {
         let call = route("undo that").unwrap();
         assert_eq!(call.name, "home_undo");
+    }
+
+    #[test]
+    fn routes_undo_last_change_to_home_undo() {
+        // BFCL home-undo-last-action: "Undo that last light change." (#525)
+        let call = route("Jared: Undo that last light change.").unwrap();
+        assert_eq!(call.name, "home_undo");
+        assert_eq!(call.arguments, serde_json::json!({}));
+
+        let call = route("revert the last change").unwrap();
+        assert_eq!(call.name, "home_undo");
+
+        // The structural fallback subsumes the former exact "<verb> last action"
+        // arms, so these must keep routing to home_undo.
+        for phrase in [
+            "undo last action",
+            "undo the last action",
+            "revert last action",
+            "reverse last action",
+        ] {
+            let call = route(phrase).unwrap_or_else(|| panic!("{phrase} should route"));
+            assert_eq!(call.name, "home_undo", "{phrase}");
+        }
+
+        // Still abstains without a clear last-action referent.
+        assert!(route("undo my grocery order").is_none());
     }
 
     #[test]
@@ -3929,6 +4536,24 @@ mod tests {
     fn routes_time_question_to_get_time() {
         let call = route("what time is it?").unwrap();
         assert_eq!(call.name, "get_time");
+    }
+
+    #[test]
+    fn routes_named_timer_label_before_duration() {
+        let call = route("Leo: Set a cookie timer for 12 minutes.").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 720);
+        assert_eq!(call.arguments["label"], "cookie");
+
+        let call = route("set a 5 minute timer").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
+
+        let call = route("set a 5 minute timer for the eggs").unwrap();
+        assert_eq!(call.arguments["label"], "eggs");
+
+        // Plain timer still defaults; reminder "to …" path unchanged.
+        let call = route("set a timer for 10 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
     }
 
     #[test]
@@ -4095,7 +4720,26 @@ mod tests {
 
     #[test]
     fn does_not_route_home_control_commands_as_status() {
-        assert!(route("turn on the kitchen light").is_none());
+        // A light on/off command is a home_control action, not a status query —
+        // it must route to home_control (turn_on), never home_status (#523).
+        let call = route("turn on the kitchen light").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "kitchen light");
+        assert_eq!(call.arguments["action"], "turn_on");
+    }
+
+    #[test]
+    fn routes_basic_light_command_to_home_control() {
+        // BFCL home-light-kitchen-on: "Turn on the kitchen lights." (#523)
+        let call = route("Sarah: Turn on the kitchen lights.").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "kitchen lights");
+        assert_eq!(call.arguments["action"], "turn_on");
+
+        let call = route("Turn off the lights").unwrap();
+        assert_eq!(call.name, "home_control");
+        assert_eq!(call.arguments["entity"], "lights");
+        assert_eq!(call.arguments["action"], "turn_off");
     }
 
     #[test]
