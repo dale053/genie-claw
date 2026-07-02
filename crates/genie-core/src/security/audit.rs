@@ -25,9 +25,10 @@ pub enum Severity {
 }
 
 /// Emit a structured trace event when the voice pipeline resolves (or fails to
-/// resolve) a speaker identity. Called once per voice turn; no-op when the
-/// provider is `None` or `Fixed` because those paths always return a known
-/// result and don't touch biometric data.
+/// resolve) a speaker identity. Called once per voice turn regardless of
+/// provider — including `None` and `Fixed`, where `name`/`confidence` are the
+/// provider's fixed or "unknown" values — so operators get a consistent
+/// per-turn trace no matter which provider is configured.
 pub fn log_speaker_resolved(name: &str, confidence: &str) {
     tracing::info!(speaker = name, confidence, "speaker identity resolved");
 }

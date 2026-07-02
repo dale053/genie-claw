@@ -22,6 +22,16 @@ pub struct ConversationMeta {
     pub message_count: usize,
 }
 
+/// A persisted message, including the resolved speaker (if any) that was
+/// tagged when the message was appended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredMessage {
+    pub role: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+}
+
 impl ConversationStore {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -150,17 +160,18 @@ impl ConversationStore {
         }
     }
 
-    /// Get all messages in a conversation.
-    pub fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT role, content FROM messages WHERE conv_id = ?1 ORDER BY ts_ms ASC")?;
+    /// Get all messages in a conversation, including the tagged speaker (if any).
+    pub fn get_messages(&self, conv_id: &str) -> Result<Vec<StoredMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT role, content, speaker FROM messages WHERE conv_id = ?1 ORDER BY ts_ms ASC",
+        )?;
 
         let messages = stmt
             .query_map([conv_id], |row| {
-                Ok(Message {
+                Ok(StoredMessage {
                     role: row.get(0)?,
                     content: row.get(1)?,
+                    speaker: row.get(2)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -382,6 +393,31 @@ mod tests {
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].role, "assistant");
+    }
+
+    #[test]
+    fn append_persists_speaker_round_trip() {
+        let store = temp_store();
+        let id = store.create().unwrap();
+
+        store
+            .append(&id, "user", "hello", None, Some("dana"))
+            .unwrap();
+        store
+            .append(&id, "assistant", "hi there!", None, None)
+            .unwrap();
+
+        let messages = store.get_messages(&id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].speaker.as_deref(),
+            Some("dana"),
+            "speaker tagged on the user turn should round-trip through storage"
+        );
+        assert_eq!(
+            messages[1].speaker, None,
+            "turns appended without a speaker should read back as None"
+        );
     }
 
     #[test]

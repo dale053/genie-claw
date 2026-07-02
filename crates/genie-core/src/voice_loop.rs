@@ -366,7 +366,7 @@ async fn run_with_wakeword(
                             let read_context = identity::build_memory_read_context(&text, &speaker);
                             crate::security::audit::log_speaker_resolved(
                                 speaker.name.as_deref().unwrap_or("unknown"),
-                                &format!("{:?}", speaker.confidence),
+                                speaker.confidence.as_str(),
                             );
                             let _ = tokio::fs::remove_file(&followup_path).await;
 
@@ -1084,7 +1084,7 @@ pub async fn process_transcript(
     let read_context = identity::build_memory_read_context(&text, &speaker);
     crate::security::audit::log_speaker_resolved(
         speaker.name.as_deref().unwrap_or("unknown"),
-        &format!("{:?}", speaker.confidence),
+        speaker.confidence.as_str(),
     );
     if let Some(path) = wav_path {
         let _ = tokio::fs::remove_file(path).await;
