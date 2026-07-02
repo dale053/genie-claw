@@ -1,5 +1,5 @@
 {"id":"home-light-kitchen-on","category":"home_control","prompt":"Sarah: Turn on the kitchen lights.","expected_tool_calls":[{"tool":"home_control","arguments":{"entity":"kitchen lights","action":"turn_on"}}]}
-{"id":"timer-cookies","category":"timer","prompt":"Leo: Set a cookie timer for 12 minutes.","expected_tool_calls":[{"tool":"set_timer","arguments":{"seconds":720,"label":"cookies"}}]}
+{"id":"timer-cookies","category":"timer","prompt":"Leo: Set a cookie timer for 12 minutes.","expected_tool_calls":[{"tool":"set_timer","arguments":{"seconds":720,"label":"cookie"}}]}
 {"id":"time-current","category":"time","prompt":"Mia: What time is it?","expected_tool_calls":[{"tool":"get_time","arguments":{}}]}
 {"id":"memory-grandma-wifi","category":"memory","prompt":"Sarah: Find Grandma's Wi-Fi note.","expected_tool_calls":[{"tool":"memory_recall","arguments":{"query":"Grandma Wi-Fi note","limit":3}}]}
 {"id":"weather-school-pickup","category":"weather","prompt":"Jared: Is it raining for school pickup?","expected_tool_calls":[{"tool":"get_weather","arguments":{"location":"home"}}],"allow_extra_arguments":true}
@@ -19,3 +19,8 @@
 {"id":"multi-homework-timer","category":"multi_tool","prompt":"Sarah: Start homework mode and set a 45 minute focus timer.","expected_tool_calls":[{"tool":"home_control","arguments":{"entity":"homework mode","action":"activate"}},{"tool":"set_timer","arguments":{"seconds":2700,"label":"homework focus"}}]}
 {"id":"function-call-memory-status","category":"memory","prompt":"Jared: Check memory health.","expected_tool_calls":[{"tool":"memory_status","arguments":{}}]}
 {"id":"single-key-calculate","category":"calculate","prompt":"Leo: What is two plus two?","expected_tool_calls":[{"tool":"calculate","arguments":{"expression":"2 + 2"}}]}
+{"id":"memory-store-allergy-statement","category":"memory","prompt":"I'm allergic to peanuts","expected_tool_calls":[{"tool":"memory_store","arguments":{"category":"health_tracker"}}],"allow_extra_arguments":true}
+{"id":"memory-store-meeting-statement","category":"memory","prompt":"I have a meeting on Saturday 10AM","expected_tool_calls":[{"tool":"memory_store","arguments":{"category":"reminders"}}],"allow_extra_arguments":true}
+{"id":"memory-store-remember-appointment","category":"memory","prompt":"Remember my dentist appointment is next Tuesday 3pm","expected_tool_calls":[{"tool":"memory_store","arguments":{"category":"reminders"}}],"allow_extra_arguments":true}
+{"id":"memory-store-remember-fact","category":"memory","prompt":"Remember that the wifi password is hunter2","expected_tool_calls":[{"tool":"memory_store","arguments":{"category":"fact"}}],"allow_extra_arguments":true}
+{"id":"memory-recall-allergy-question","category":"memory","prompt":"Is anyone allergic to peanuts?","expected_tool_calls":[{"tool":"memory_recall","arguments":{}}],"allow_extra_arguments":true}
