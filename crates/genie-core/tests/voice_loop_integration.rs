@@ -200,7 +200,6 @@ async fn full_mock_voice_turn_persists_user_and_assistant_to_conversation_store(
     assert_eq!(transcript.text, "turn the kitchen light on");
     store
         .append(conv_id, "user", transcript.text.trim(), None, None)
-        .append(conv_id, "user", transcript.text.trim(), None)
         .await
         .unwrap();
 
@@ -215,7 +214,6 @@ async fn full_mock_voice_turn_persists_user_and_assistant_to_conversation_store(
     assert_eq!(reply, "Done — kitchen light is on.");
     store
         .append(conv_id, "assistant", &reply, None, None)
-        .append(conv_id, "assistant", &reply, None)
         .await
         .unwrap();
 
@@ -257,7 +255,6 @@ async fn mock_voice_cycle_drives_stt_then_llm_then_streaming_tts_then_tool_audit
 
     store
         .append(conv_id, "user", transcript.text.trim(), None, None)
-        .append(conv_id, "user", transcript.text.trim(), None)
         .await
         .unwrap();
 
@@ -286,7 +283,6 @@ async fn mock_voice_cycle_drives_stt_then_llm_then_streaming_tts_then_tool_audit
             Some(&tool_result.tool),
             None,
         )
-        .append(conv_id, "assistant", &llm_output, Some(&tool_result.tool))
         .await
         .unwrap();
     store
@@ -337,8 +333,10 @@ async fn mock_voice_turn_handles_back_to_back_cycles_without_state_bleed() {
     for expected_user in ["first prompt", "second prompt"] {
         let t = stt.transcribe_file("ignored.wav").await.unwrap();
         assert_eq!(t.text, expected_user);
-        store.append(conv_id, "user", &t.text, None, None).unwrap();
-        store.append(conv_id, "user", &t.text, None).await.unwrap();
+        store
+            .append(conv_id, "user", &t.text, None, None)
+            .await
+            .unwrap();
         let reply = llm
             .chat(
                 &[Message {
@@ -351,7 +349,6 @@ async fn mock_voice_turn_handles_back_to_back_cycles_without_state_bleed() {
             .unwrap();
         store
             .append(conv_id, "assistant", &reply, None, None)
-            .append(conv_id, "assistant", &reply, None)
             .await
             .unwrap();
     }
