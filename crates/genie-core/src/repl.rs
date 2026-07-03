@@ -100,9 +100,11 @@ pub async fn run(
             );
             conversations.append_or_log(&conv_id, "assistant", &response, None);
 
-            let stored = with_shared_memory(memory, |memory| {
-                memory::extract::extract_and_store(memory, text)
-            });
+            let text_owned = text.to_string();
+            let stored = with_shared_memory(memory, move |memory| {
+                memory::extract::extract_and_store(memory, &text_owned)
+            })
+            .await;
             if stored > 0 {
                 eprintln!(
                     "(remembered {} fact{})",
@@ -114,9 +116,11 @@ pub async fn run(
         }
 
         // Build context with per-query memory injection.
-        let memory_context = with_shared_memory(memory, |memory| {
-            memory::inject::build_memory_context(memory, text)
-        });
+        let text_owned = text.to_string();
+        let memory_context = with_shared_memory(memory, move |memory| {
+            memory::inject::build_memory_context(memory, &text_owned)
+        })
+        .await;
         let full_prompt = format!(
             "{}\n\nRelevant household context:\n{}",
             system_prompt, memory_context
@@ -232,9 +236,11 @@ pub async fn run(
         }
 
         // Auto-capture facts.
-        let stored = with_shared_memory(memory, |memory| {
-            memory::extract::extract_and_store(memory, text)
-        });
+        let text_owned = text.to_string();
+        let stored = with_shared_memory(memory, move |memory| {
+            memory::extract::extract_and_store(memory, &text_owned)
+        })
+        .await;
         if stored > 0 {
             eprintln!(
                 "(remembered {} fact{})",

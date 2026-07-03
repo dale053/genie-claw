@@ -49,12 +49,35 @@ pub struct Memory {
 /// Process-wide handle to the single memory store opened at startup.
 pub type SharedMemory = Arc<Mutex<Memory>>;
 
-/// Run a closure against the shared memory store.
-pub fn with_shared_memory<R>(memory: &SharedMemory, f: impl FnOnce(&Memory) -> R) -> R {
-    let guard = memory
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    f(&guard)
+/// Run a closure against the shared memory store on the blocking thread pool.
+///
+/// genie-core's HTTP server and Telegram adapter share one OS thread
+/// (`tokio::main(flavor = "current_thread")`, see `lib.rs`). `Memory`'s own
+/// methods are synchronous `rusqlite`/FTS5 calls with no internal `.await`,
+/// so running `f` directly on the caller's task would block every other
+/// in-flight HTTP connection and Telegram chat for as long as `f` takes —
+/// the same bug class #571 already fixed for `ConversationStore`, unfixed
+/// here until now. `with_shared_memory` is the one choke point every memory
+/// access already goes through, so `spawn_blocking` is applied here instead
+/// of on each of `Memory`'s 49 individual methods: the whole lock-and-call
+/// unit moves onto Tokio's blocking pool, leaving `Memory`'s internals
+/// untouched.
+pub async fn with_shared_memory<R>(
+    memory: &SharedMemory,
+    f: impl FnOnce(&Memory) -> R + Send + 'static,
+) -> R
+where
+    R: Send + 'static,
+{
+    let memory = Arc::clone(memory);
+    tokio::task::spawn_blocking(move || {
+        let guard = memory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&guard)
+    })
+    .await
+    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11215,6 +11238,48 @@ mod tests {
         let results = mem.search("Jared", 10).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|r| r.content.contains("name is Jared")));
+    }
+
+    /// Regression: `with_shared_memory` must not monopolize the single-threaded
+    /// executor. `Memory`'s own methods are synchronous `rusqlite`/FTS5 calls
+    /// with no internal `.await`, so `with_shared_memory` runs the whole
+    /// lock-and-call unit on `spawn_blocking`'s pool. Before that fix, a
+    /// single poll of the writer task below would run all 200 synchronous
+    /// `store` calls to completion without ever yielding back to the
+    /// runtime — starving a concurrently spawned task that does nothing but
+    /// yield, on genie-core's `current_thread` runtime. This is the same
+    /// bug class already fixed for `ConversationStore`
+    /// (`conversation::tests::appends_do_not_starve_a_concurrent_task`).
+    #[tokio::test]
+    async fn with_shared_memory_does_not_starve_a_concurrent_task() {
+        let memory: SharedMemory = Arc::new(Mutex::new(temp_memory()));
+
+        let writer = {
+            let memory = Arc::clone(&memory);
+            tokio::spawn(async move {
+                for i in 0..200 {
+                    let content = format!("fact number {i}");
+                    with_shared_memory(&memory, move |mem| {
+                        mem.store("fact", &content).unwrap();
+                    })
+                    .await;
+                }
+            })
+        };
+
+        let interleaved = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for _ in 0..2000 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        writer.await.unwrap();
+        assert!(
+            interleaved.is_ok(),
+            "a concurrent task was starved while memory writes were in flight — \
+             with_shared_memory regressed to blocking the executor thread"
+        );
     }
 
     #[test]

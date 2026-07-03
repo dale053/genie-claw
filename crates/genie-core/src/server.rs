@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, Semaphore};
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
 use crate::llm::{LlmBackendClient, LlmClient, LlmRequestHints, Message, PrivacyProxyBackend};
-use crate::memory::{Memory, SharedMemory, with_shared_memory};
+use crate::memory::{SharedMemory, with_shared_memory};
 use crate::origin_auth::OriginResolver;
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
@@ -266,12 +266,12 @@ impl ChatServer {
                     let interval = Duration::from_secs(interval_hours * 3600);
                     loop {
                         tokio::time::sleep(interval).await;
-                        let mem_result = with_shared_memory(&pruner_ctx.memory, |mem| {
-                            mem.prune_and_checkpoint(
-                                pruner_ctx.storage_config.memory_decay_threshold,
-                                pruner_ctx.storage_config.memory_stale_days,
-                            )
-                        });
+                        let decay_threshold = pruner_ctx.storage_config.memory_decay_threshold;
+                        let stale_days = pruner_ctx.storage_config.memory_stale_days;
+                        let mem_result = with_shared_memory(&pruner_ctx.memory, move |mem| {
+                            mem.prune_and_checkpoint(decay_threshold, stale_days)
+                        })
+                        .await;
                         match mem_result {
                             Ok((decayed, stale)) => {
                                 tracing::info!(decayed, stale, "auto-prune: memory entries removed")
@@ -799,10 +799,10 @@ async fn handle_request(
         RequestRoute::ActuationPending => handle_actuation_pending(tools),
         RequestRoute::ActuationActions => handle_actuation_actions(tools),
         RequestRoute::ActuationConfirm => handle_actuation_confirm(body.as_deref(), tools).await,
-        RequestRoute::MemoriesList => handle_memories_list(memory),
-        RequestRoute::MemoriesUpdate => handle_memories_update(body.as_deref(), memory),
-        RequestRoute::MemoriesDelete => handle_memories_delete(body.as_deref(), memory),
-        RequestRoute::MemoriesReorder => handle_memories_reorder(body.as_deref(), memory),
+        RequestRoute::MemoriesList => handle_memories_list(memory).await,
+        RequestRoute::MemoriesUpdate => handle_memories_update(body.as_deref(), memory).await,
+        RequestRoute::MemoriesDelete => handle_memories_delete(body.as_deref(), memory).await,
+        RequestRoute::MemoriesReorder => handle_memories_reorder(body.as_deref(), memory).await,
         RequestRoute::OpenAiChat => match chat_gate.try_acquire().await {
             Some(_guard) => {
                 handle_openai_chat(
@@ -990,9 +990,11 @@ async fn handle_chat_stream(
             &serde_json::json!({"type":"replace","content": final_response.clone(), "tool": tool_result.tool.clone()}),
         )
         .await?;
-        with_shared_memory(memory, |memory| {
-            crate::memory::extract::extract_and_store(memory, user_text);
-        });
+        let user_text_owned = user_text.to_string();
+        with_shared_memory(memory, move |memory| {
+            crate::memory::extract::extract_and_store(memory, &user_text_owned);
+        })
+        .await;
         write_stream_event(
             writer,
             &serde_json::json!({
@@ -1006,9 +1008,11 @@ async fn handle_chat_stream(
         return Ok(());
     }
 
-    let memory_context = with_shared_memory(memory, |memory| {
-        crate::memory::inject::build_memory_context(memory, user_text)
-    });
+    let user_text_owned = user_text.to_string();
+    let memory_context = with_shared_memory(memory, move |memory| {
+        crate::memory::inject::build_memory_context(memory, &user_text_owned)
+    })
+    .await;
     let full_prompt = format!(
         "{}\n\nRelevant household context:\n{}",
         system_prompt, memory_context
@@ -1162,9 +1166,11 @@ async fn handle_chat_stream(
         sanitized
     };
 
-    with_shared_memory(memory, |memory| {
-        crate::memory::extract::extract_and_store(memory, user_text);
-    });
+    let user_text_owned = user_text.to_string();
+    with_shared_memory(memory, move |memory| {
+        crate::memory::extract::extract_and_store(memory, &user_text_owned);
+    })
+    .await;
 
     write_stream_event(
         writer,
@@ -1212,9 +1218,11 @@ pub async fn process_chat_turn(
             )
             .await;
         let final_response = finalize_direct_tool_turn(conversations, conv_id, &call, &tool_result);
-        with_shared_memory(memory, |memory| {
-            crate::memory::extract::extract_and_store(memory, user_text);
-        });
+        let user_text_owned = user_text.to_string();
+        with_shared_memory(memory, move |memory| {
+            crate::memory::extract::extract_and_store(memory, &user_text_owned);
+        })
+        .await;
         return Ok(ChatTurnResult {
             response: final_response,
             tool: Some(tool_result.tool),
@@ -1222,9 +1230,11 @@ pub async fn process_chat_turn(
         });
     }
 
-    let memory_context = with_shared_memory(memory, |memory| {
-        crate::memory::inject::build_memory_context(memory, user_text)
-    });
+    let user_text_owned = user_text.to_string();
+    let memory_context = with_shared_memory(memory, move |memory| {
+        crate::memory::inject::build_memory_context(memory, &user_text_owned)
+    })
+    .await;
     let full_prompt = format!(
         "{}\n\nRelevant household context:\n{}",
         system_prompt, memory_context
@@ -1349,9 +1359,11 @@ pub async fn process_chat_turn(
         sanitized
     };
 
-    with_shared_memory(memory, |memory| {
-        crate::memory::extract::extract_and_store(memory, user_text);
-    });
+    let user_text_owned = user_text.to_string();
+    with_shared_memory(memory, move |memory| {
+        crate::memory::extract::extract_and_store(memory, &user_text_owned);
+    })
+    .await;
 
     Ok(ChatTurnResult {
         response: final_response,
@@ -1387,6 +1399,7 @@ async fn escalate_via_privacy_proxy(
                 .collect(),
         )
     })
+    .await
     .unwrap_or_default();
 
     if let Err(e) = backend.seed_vocab(&terms).await {
@@ -1695,28 +1708,30 @@ async fn handle_health(
 ) -> (u16, &'static str, String) {
     let llm_ok = llm.health().await;
     let connectivity_health = connectivity.health().await;
-    let (mem_count, memory_health, memory_db_bytes) = with_shared_memory(memory, |memory| {
-        (
-            memory.count().unwrap_or(0),
-            memory.health().ok(),
-            memory.db_size_bytes().unwrap_or(0),
-        )
-    });
+    let (mem_count, mem_promoted_count, memory_health, memory_db_bytes) =
+        with_shared_memory(memory, |memory| {
+            (
+                memory.count().unwrap_or(0),
+                memory.promoted_count().unwrap_or(0),
+                memory.health().ok(),
+                memory.db_size_bytes().unwrap_or(0),
+            )
+        })
+        .await;
     let conv_count = conversations.list().map(|l| l.len()).unwrap_or(0);
     let conversation_db_bytes = conversations.db_size_bytes().unwrap_or(0);
     let mem_avail = genie_common::tegrastats::mem_available_mb().unwrap_or(0);
     let chat = chat_gate.snapshot();
-    let runtime_contract = with_shared_memory(memory, |memory| {
-        build_runtime_contract_snapshot(
-            tools,
-            memory,
-            conversations,
-            system_prompt,
-            max_history,
-            model_family,
-            &connectivity_health,
-        )
-    });
+    let runtime_contract = build_runtime_contract_snapshot(
+        tools,
+        mem_count,
+        mem_promoted_count,
+        conversations,
+        system_prompt,
+        max_history,
+        model_family,
+        &connectivity_health,
+    );
     let runtime_contract =
         runtime_contract_summary_json(&runtime_contract, expected_runtime_contract_hash);
 
@@ -1838,17 +1853,23 @@ async fn handle_runtime_contract(
     expected_runtime_contract_hash: &str,
 ) -> (u16, &'static str, String) {
     let connectivity_health = connectivity.health().await;
-    let contract = with_shared_memory(memory, |memory| {
-        build_runtime_contract_snapshot(
-            tools,
-            memory,
-            conversations,
-            system_prompt,
-            max_history,
-            model_family,
-            &connectivity_health,
+    let (mem_count, mem_promoted_count) = with_shared_memory(memory, |memory| {
+        (
+            memory.count().unwrap_or(0),
+            memory.promoted_count().unwrap_or(0),
         )
-    });
+    })
+    .await;
+    let contract = build_runtime_contract_snapshot(
+        tools,
+        mem_count,
+        mem_promoted_count,
+        conversations,
+        system_prompt,
+        max_history,
+        model_family,
+        &connectivity_health,
+    );
     let body = runtime_contract_json(&contract, expected_runtime_contract_hash);
     let body = serde_json::to_string(&body).unwrap_or_else(|e| {
         serde_json::json!({ "error": format!("runtime contract serialization failed: {e}") })
@@ -1859,7 +1880,8 @@ async fn handle_runtime_contract(
 
 pub fn build_runtime_contract_snapshot(
     tools: &ToolDispatcher,
-    memory: &Memory,
+    mem_count: usize,
+    mem_promoted_count: usize,
     conversations: &ConversationStore,
     system_prompt: &str,
     max_history: usize,
@@ -1869,8 +1891,8 @@ pub fn build_runtime_contract_snapshot(
     let tool_defs = tools.tool_defs();
     let hydration = serde_json::json!({
         "memory": {
-            "count": memory.count().unwrap_or(0),
-            "promoted_count": memory.promoted_count().unwrap_or(0),
+            "count": mem_count,
+            "promoted_count": mem_promoted_count,
         },
         "conversations": {
             "count": conversations.list().map(|items| items.len()).unwrap_or(0),
@@ -1957,8 +1979,8 @@ fn handle_actuation_actions(tools: &ToolDispatcher) -> (u16, &'static str, Strin
     (200, "application/json", body.to_string())
 }
 
-fn handle_memories_list(memory: &SharedMemory) -> (u16, &'static str, String) {
-    match with_shared_memory(memory, |memory| memory.list_managed(500)) {
+async fn handle_memories_list(memory: &SharedMemory) -> (u16, &'static str, String) {
+    match with_shared_memory(memory, |memory| memory.list_managed(500)).await {
         Ok(entries) => (
             200,
             "application/json",
@@ -1972,7 +1994,7 @@ fn handle_memories_list(memory: &SharedMemory) -> (u16, &'static str, String) {
     }
 }
 
-fn handle_memories_update(
+async fn handle_memories_update(
     body: Option<&str>,
     memory: &SharedMemory,
 ) -> (u16, &'static str, String) {
@@ -1995,9 +2017,11 @@ fn handle_memories_update(
         }
     };
 
-    match with_shared_memory(memory, |memory| {
+    match with_shared_memory(memory, move |memory| {
         memory.update_managed(req.id, &req.content, req.kind.as_deref())
-    }) {
+    })
+    .await
+    {
         Ok(true) => (
             200,
             "application/json",
@@ -2016,7 +2040,7 @@ fn handle_memories_update(
     }
 }
 
-fn handle_memories_delete(
+async fn handle_memories_delete(
     body: Option<&str>,
     memory: &SharedMemory,
 ) -> (u16, &'static str, String) {
@@ -2039,7 +2063,7 @@ fn handle_memories_delete(
         }
     };
 
-    match with_shared_memory(memory, |memory| memory.delete_by_id(req.id)) {
+    match with_shared_memory(memory, move |memory| memory.delete_by_id(req.id)).await {
         Ok(true) => (
             200,
             "application/json",
@@ -2058,7 +2082,7 @@ fn handle_memories_delete(
     }
 }
 
-fn handle_memories_reorder(
+async fn handle_memories_reorder(
     body: Option<&str>,
     memory: &SharedMemory,
 ) -> (u16, &'static str, String) {
@@ -2081,7 +2105,7 @@ fn handle_memories_reorder(
         }
     };
 
-    match with_shared_memory(memory, |memory| memory.reorder_managed(&req.ids)) {
+    match with_shared_memory(memory, move |memory| memory.reorder_managed(&req.ids)).await {
         Ok(()) => (
             200,
             "application/json",
@@ -2327,16 +2351,20 @@ async fn handle_openai_chat(
             format!("{} failed: {}", tool_result.tool, tool_result.output)
         };
         let sanitized = crate::security::sandbox::sanitize_output(&response);
-        with_shared_memory(memory, |memory| {
-            crate::memory::extract::extract_and_store(memory, &user_text);
-        });
+        let user_text_owned = user_text.clone();
+        with_shared_memory(memory, move |memory| {
+            crate::memory::extract::extract_and_store(memory, &user_text_owned);
+        })
+        .await;
         return openai_chat_response(model, &sanitized);
     }
 
     // Build context with per-query memory injection.
-    let memory_context = with_shared_memory(memory, |memory| {
-        crate::memory::inject::build_memory_context(memory, &user_text)
-    });
+    let user_text_owned = user_text.clone();
+    let memory_context = with_shared_memory(memory, move |memory| {
+        crate::memory::inject::build_memory_context(memory, &user_text_owned)
+    })
+    .await;
     let full_prompt = format!(
         "{}\n\nRelevant household context:\n{}",
         system_prompt, memory_context
@@ -2448,9 +2476,10 @@ async fn handle_openai_chat(
     let sanitized = crate::security::sandbox::sanitize_output(&final_response);
 
     // Auto-capture facts from user message.
-    with_shared_memory(memory, |memory| {
+    with_shared_memory(memory, move |memory| {
         crate::memory::extract::extract_and_store(memory, &user_text);
-    });
+    })
+    .await;
 
     openai_chat_response(model, &sanitized)
 }
