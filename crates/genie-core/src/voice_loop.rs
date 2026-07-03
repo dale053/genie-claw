@@ -146,7 +146,7 @@ pub async fn run(
             .with_language_hint(Some(voice_cfg.stt_language.clone()))
     };
 
-    let conv_id = conversations.create()?;
+    let conv_id = conversations.create().await?;
     tracing::info!(conv_id = %conv_id, "voice conversation started");
 
     if llm.health().await {
@@ -383,7 +383,9 @@ async fn run_with_wakeword(
 
                             // Build context and process — reuse voice_cycle but skip recording
                             // (we already have the text).
-                            conversations.append_or_log(conv_id, "user", &text, None);
+                            conversations
+                                .append_or_log(conv_id, "user", &text, None)
+                                .await;
 
                             if handle_quick_tool_for_voice(
                                 tools,
@@ -416,6 +418,7 @@ async fn run_with_wakeword(
                             );
                             let history = conversations
                                 .get_recent(conv_id, max_history)
+                                .await
                                 .unwrap_or_default();
                             let mut messages = vec![crate::llm::Message {
                                 role: "system".into(),
@@ -440,12 +443,9 @@ async fn run_with_wakeword(
                             .await
                             {
                                 Ok(response) => {
-                                    conversations.append_or_log(
-                                        conv_id,
-                                        "assistant",
-                                        &response,
-                                        None,
-                                    );
+                                    conversations
+                                        .append_or_log(conv_id, "assistant", &response, None)
+                                        .await;
                                     eprintln!("[voice] GeniePod: {}", format::for_voice(&response));
                                 }
                                 Err(e) => {
@@ -721,7 +721,9 @@ async fn handle_quick_tool_for_voice(
         };
         if let Some(rejected) = tools.gate_tool_call(&call, exec_ctx) {
             let response = crate::security::sandbox::sanitize_output(&rejected.output);
-            conversations.append_or_log(conv_id, "assistant", &response, None);
+            conversations
+                .append_or_log(conv_id, "assistant", &response, None)
+                .await;
             let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
             let voice_text = format::for_voice(&response);
             if !voice_text.is_empty() {
@@ -738,7 +740,9 @@ async fn handle_quick_tool_for_voice(
                         crate::security::sandbox::sanitize_output(&format!("Tool error: {error}"));
                     let started = std::time::Instant::now();
                     tools.audit_gated_tool(&call, exec_ctx, started, false, &response);
-                    conversations.append_or_log(conv_id, "assistant", &response, None);
+                    conversations
+                        .append_or_log(conv_id, "assistant", &response, None)
+                        .await;
                     let tts_engine =
                         tts_engine_for_language(voice_cfg, audio_device, response_language);
                     let voice_text = format::for_voice(&response);
@@ -769,9 +773,15 @@ async fn handle_quick_tool_for_voice(
         })
         .to_string();
 
-        conversations.append_or_log(conv_id, "assistant", &tool_json, Some("web_search"));
-        conversations.append_or_log(conv_id, "system", &format!("Tool: {}", response), None);
-        conversations.append_or_log(conv_id, "assistant", &response, None);
+        conversations
+            .append_or_log(conv_id, "assistant", &tool_json, Some("web_search"))
+            .await;
+        conversations
+            .append_or_log(conv_id, "system", &format!("Tool: {}", response), None)
+            .await;
+        conversations
+            .append_or_log(conv_id, "assistant", &response, None)
+            .await;
 
         let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
         let voice_text = format::for_voice(&voice_response);
@@ -804,14 +814,20 @@ async fn handle_quick_tool_for_voice(
     })
     .to_string();
 
-    conversations.append_or_log(conv_id, "assistant", &tool_json, Some(&tool_result.tool));
-    conversations.append_or_log(
-        conv_id,
-        "system",
-        &format!("Tool: {}", tool_result.output),
-        None,
-    );
-    conversations.append_or_log(conv_id, "assistant", &response, None);
+    conversations
+        .append_or_log(conv_id, "assistant", &tool_json, Some(&tool_result.tool))
+        .await;
+    conversations
+        .append_or_log(
+            conv_id,
+            "system",
+            &format!("Tool: {}", tool_result.output),
+            None,
+        )
+        .await;
+    conversations
+        .append_or_log(conv_id, "assistant", &response, None)
+        .await;
 
     let tts_engine = tts_engine_for_language(voice_cfg, audio_device, response_language);
     let voice_text = format::for_voice(&response);
@@ -1073,7 +1089,9 @@ pub async fn process_transcript(
         "[voice] You said: \"{}\" (STT: {} ms)",
         text, transcript.duration_ms
     );
-    conversations.append_or_log(conv_id, "user", &text, None);
+    conversations
+        .append_or_log(conv_id, "user", &text, None)
+        .await;
 
     if let Some(final_response) = handle_quick_tool_for_voice(
         tools,
@@ -1119,6 +1137,7 @@ pub async fn process_transcript(
 
     let history = conversations
         .get_recent(conv_id, max_history)
+        .await
         .unwrap_or_default();
     let mut messages = vec![crate::llm::Message {
         role: "system".into(),
@@ -1200,16 +1219,23 @@ pub async fn process_transcript(
             "[voice] Tool: {} → {}",
             tool_result.tool, tool_result.output
         );
-        conversations.append_or_log(conv_id, "assistant", &response, Some(&tool_result.tool));
-        conversations.append_or_log(
-            conv_id,
-            "system",
-            &format!("Tool: {}", tool_result.output),
-            None,
-        );
+        conversations
+            .append_or_log(conv_id, "assistant", &response, Some(&tool_result.tool))
+            .await;
+        conversations
+            .append_or_log(
+                conv_id,
+                "system",
+                &format!("Tool: {}", tool_result.output),
+                None,
+            )
+            .await;
 
         // Get summary and speak it.
-        let recent = conversations.get_recent(conv_id, 6).unwrap_or_default();
+        let recent = conversations
+            .get_recent(conv_id, 6)
+            .await
+            .unwrap_or_default();
         let mut summary_msgs = vec![crate::llm::Message {
             role: "system".into(),
             content: if let Some(language) = response_language.as_deref() {
@@ -1260,10 +1286,14 @@ pub async fn process_transcript(
             }
         };
 
-        conversations.append_or_log(conv_id, "assistant", &summary, None);
+        conversations
+            .append_or_log(conv_id, "assistant", &summary, None)
+            .await;
         (summary, Some(tool_result.tool))
     } else {
-        conversations.append_or_log(conv_id, "assistant", &response, None);
+        conversations
+            .append_or_log(conv_id, "assistant", &response, None)
+            .await;
         (response, None)
     };
 

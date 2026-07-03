@@ -1147,28 +1147,67 @@ impl Memory {
     }
 
     /// Mark a memory as promoted (moved to permanent storage).
+    ///
+    /// Convenience wrapper around [`mark_promoted_many`](Self::mark_promoted_many)
+    /// for the single-id case; the resulting DB row, MEMORY.md tree, and canonical
+    /// event are identical to promoting a one-element batch.
     pub fn mark_promoted(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute("UPDATE memories SET promoted = 1 WHERE id = ?1", [id])?;
-        if let Some(entry) = self.get_by_id(id)? {
-            let shared_safe = policy::assess_memory_read(
-                entry.metadata,
-                policy::MemoryReadContext::shared_room_voice(),
-            )
-            .allowed;
-            self.rebuild_root_memory_file()?;
-            self.record_canonical_event(MemoryEvent {
-                ts_ms: now_ms(),
-                action: "promote",
-                id: Some(id),
-                kind: Some(entry.kind),
-                content: Some(entry.content),
-                detail: Some(if shared_safe {
-                    "added to MEMORY.md".into()
-                } else {
-                    "promotion retained in DB only; skipped MEMORY.md due to policy".into()
-                }),
-            })?;
+        self.mark_promoted_many(&[id])
+    }
+
+    /// Mark several memories as promoted in one pass.
+    ///
+    /// Applies every `promoted = 1` update and records each promotion's canonical
+    /// event, then rebuilds the canonical MEMORY.md tree exactly once for the
+    /// whole batch. Previously each promotion called
+    /// [`rebuild_root_memory_file`](Self::rebuild_root_memory_file) on its own — a
+    /// full `WHERE promoted = 1` table scan plus a complete rewrite of MEMORY.md,
+    /// INDEX.md, and every namespace file — so a dream cycle promoting P memories
+    /// did P rebuilds when only the final on-disk state is ever observed. Batching
+    /// collapses that to a single rebuild; the resulting DB rows, MEMORY.md tree,
+    /// and per-promotion canonical events are unchanged. Ids that don't resolve to
+    /// a row are skipped (matching the single-id path), and an all-miss batch
+    /// performs no rebuild. Contributes under #402 (performance bucket), the same
+    /// batching pattern as the `prune_decayed` deletes.
+    pub fn mark_promoted_many(&self, ids: &[i64]) -> Result<()> {
+        // Apply each promotion and stage its canonical event. The event detail
+        // depends only on that entry's own policy metadata, not on global state,
+        // so recording the events after a single batch rebuild is equivalent to
+        // recording each one after its own rebuild.
+        let mut events = Vec::new();
+        for &id in ids {
+            self.conn
+                .execute("UPDATE memories SET promoted = 1 WHERE id = ?1", [id])?;
+            if let Some(entry) = self.get_by_id(id)? {
+                let shared_safe = policy::assess_memory_read(
+                    entry.metadata,
+                    policy::MemoryReadContext::shared_room_voice(),
+                )
+                .allowed;
+                events.push(MemoryEvent {
+                    ts_ms: now_ms(),
+                    action: "promote",
+                    id: Some(id),
+                    kind: Some(entry.kind),
+                    content: Some(entry.content),
+                    detail: Some(if shared_safe {
+                        "added to MEMORY.md".into()
+                    } else {
+                        "promotion retained in DB only; skipped MEMORY.md due to policy".into()
+                    }),
+                });
+            }
+        }
+
+        // No id resolved to a real row → nothing observable changed, so skip the
+        // rebuild (the single-id path likewise rebuilt only when the id existed).
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        self.rebuild_root_memory_file()?;
+        for event in events {
+            self.record_canonical_event(event)?;
         }
         Ok(())
     }
@@ -11481,6 +11520,88 @@ mod tests {
         eprintln!(
             "query_diversity over {n} ids: old(N+1) {old_ns} ns -> new(batched) {new_ns} ns ({:.2}x)",
             old_ns as f64 / new_ns as f64
+        );
+    }
+
+    #[test]
+    fn wal_pruning_path_recovers_after_unclean_shutdown() {
+        // Durability check for the WAL/pruning path (#516/#542): committed writes
+        // and a decayed-prune must survive a process that dies without a clean
+        // close, and the reopened database must pass an integrity check.
+        let path = temp_memory_path("crash-recovery");
+
+        let mem = Memory::open(&path).unwrap();
+        for i in 0..50 {
+            mem.store("fact", &format!("durable fact {i}")).unwrap();
+        }
+        // Age half the rows so the decayed-prune (the chunked IN(...) DELETE from
+        // #542) actually removes them inside the WAL before the crash.
+        mem.conn
+            .execute("UPDATE memories SET accessed_ms = 0 WHERE id % 2 = 0", [])
+            .unwrap();
+        let pruned = mem.prune_decayed(0.5).unwrap();
+        assert!(pruned > 0, "aged rows should have been pruned");
+        let survivors = mem.count().unwrap();
+
+        // Simulate an unclean shutdown: leak the connection so its destructor never
+        // runs, meaning the WAL is never checkpointed or cleanly closed. This is the
+        // state left behind by a killed process or a power loss mid-run.
+        std::mem::forget(mem);
+
+        // Recovery: a fresh connection must replay the committed WAL frames.
+        let recovered = Memory::open(&path).unwrap();
+        let integrity: String = recovered
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "database corrupt after unclean shutdown");
+        assert_eq!(
+            recovered.count().unwrap(),
+            survivors,
+            "committed state not recovered from the WAL"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_serialize_without_corruption() {
+        // WAL mode plus busy_timeout must let several connections write the same
+        // database at once without losing writes or corrupting the file.
+        let path = temp_memory_path("concurrent-write");
+        // Create the schema up front so the writer threads open an existing
+        // database and do not race on first-time migration.
+        {
+            let seed = Memory::open(&path).unwrap();
+            seed.store("fact", "seed").unwrap();
+        }
+
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 25;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    // Each thread owns its own connection; nothing is shared.
+                    let mem = Memory::open(&p).unwrap();
+                    for i in 0..PER_THREAD {
+                        mem.store("fact", &format!("thread {t} write {i}")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mem = Memory::open(&path).unwrap();
+        let integrity: String = mem
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "concurrent writes corrupted the database");
+        assert_eq!(
+            mem.count().unwrap(),
+            1 + THREADS * PER_THREAD,
+            "a concurrent write was lost"
         );
     }
 
