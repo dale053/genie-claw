@@ -15,17 +15,23 @@
 pub mod ingest;
 pub mod toml_profile;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::memory::Memory;
+use crate::memory::{Memory, SharedMemory, with_shared_memory};
 
 /// Ingest all profile data from the profile directory into memory.
 ///
 /// Called once at startup. Skips files that have already been ingested
 /// (tracked via a metadata entry in memory).
-pub fn load_profile(profile_dir: &Path, memory: &Memory) -> Result<ProfileReport> {
+///
+/// PDF extraction shells out to `pdftotext` and is the one `.await` in this
+/// function — deliberately run before taking the memory lock (via
+/// [`ingest::extract_pdf_text`]) so a hung or slow `pdftotext` call never
+/// holds `memory`'s mutex, and is itself timeout-guarded so it can't block
+/// startup indefinitely.
+pub async fn load_profile(profile_dir: &Path, memory: &SharedMemory) -> Result<ProfileReport> {
     let mut report = ProfileReport::default();
 
     if !profile_dir.exists() {
@@ -33,10 +39,14 @@ pub fn load_profile(profile_dir: &Path, memory: &Memory) -> Result<ProfileReport
         return Ok(report);
     }
 
-    // 1. Load profile.toml (structured data — always re-read).
+    // 1. Load profile.toml (structured data — always re-read). Synchronous,
+    // no subprocess involved, so a brief lock is fine.
     let toml_path = profile_dir.join("profile.toml");
     if toml_path.exists() {
-        match toml_profile::load_toml_profile(&toml_path, memory) {
+        let result = with_shared_memory(memory, |mem| {
+            toml_profile::load_toml_profile(&toml_path, mem)
+        });
+        match result {
             Ok(count) => {
                 tracing::info!(facts = count, "profile.toml loaded");
                 report.toml_facts = count;
@@ -49,22 +59,30 @@ pub fn load_profile(profile_dir: &Path, memory: &Memory) -> Result<ProfileReport
 
     // 2. Scan for document files (.md, .txt, .pdf).
     let entries = std::fs::read_dir(profile_dir)?;
+    let mut doc_paths: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
+        if path.file_name().is_some_and(|n| n == "profile.toml") {
+            continue;
+        }
+        doc_paths.push(path);
+    }
+
+    for path in doc_paths {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
 
-        // Skip profile.toml (already handled) and non-document files.
-        if path.file_name().is_some_and(|n| n == "profile.toml") {
-            continue;
-        }
-
         match ext.as_str() {
             "md" | "txt" => {
-                let count = ingest::ingest_text_file(&path, memory);
+                // Fast local disk read + synchronous memory writes — no
+                // subprocess, so one short lock for the whole file is fine.
+                let path_for_ingest = path.clone();
+                let count = with_shared_memory(memory, move |mem| {
+                    ingest::ingest_text_file(&path_for_ingest, mem)
+                });
                 if count > 0 {
                     tracing::info!(
                         file = %path.display(),
@@ -76,7 +94,19 @@ pub fn load_profile(profile_dir: &Path, memory: &Memory) -> Result<ProfileReport
                 report.files_processed += 1;
             }
             "pdf" => {
-                let count = ingest::ingest_pdf_file(&path, memory);
+                // Extraction (the subprocess call) runs with no lock held;
+                // only the resulting text is ingested under the lock.
+                let Some(text) = ingest::extract_pdf_text(&path).await else {
+                    continue;
+                };
+                let filename = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let count = with_shared_memory(memory, move |mem: &Memory| {
+                    ingest::ingest_pdf_text(&text, &filename, mem)
+                });
                 if count > 0 {
                     tracing::info!(
                         file = %path.display(),

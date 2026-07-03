@@ -6,9 +6,19 @@
 //! PDF support requires `pdftotext` (from poppler-utils) installed on the system.
 
 use std::path::Path;
+use std::time::Duration;
+
+use genie_common::subprocess::{self, SubprocessError};
 
 use crate::memory::Memory;
 use crate::memory::extract;
+
+/// Deadline for the `pdftotext` extraction subprocess. `load_profile` runs
+/// once at startup, before genie-core's HTTP server and voice loop start
+/// (see `profile/mod.rs` and `main.rs`) — without a bound here, a
+/// pathological PDF that makes `pdftotext` hang would prevent the daemon
+/// from ever finishing boot.
+const PDF_EXTRACT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Ingest a text/markdown file into memory.
 ///
@@ -27,40 +37,58 @@ pub fn ingest_text_file(path: &Path, memory: &Memory) -> usize {
     ingest_text(&content, &filename, memory)
 }
 
-/// Ingest a PDF file into memory via `pdftotext`.
+/// Extract text from a PDF file via `pdftotext`, bounded by
+/// [`PDF_EXTRACT_TIMEOUT`]. Returns `None` (after logging a warning) if
+/// `pdftotext` isn't installed, fails, or hangs past the deadline — a
+/// timeout kills the child instead of leaving it (and the caller) hung.
 ///
-/// Shells out to `pdftotext` (poppler-utils) to extract text,
-/// then runs pattern extraction on the result.
-/// Returns the number of new facts stored.
-pub fn ingest_pdf_file(path: &Path, memory: &Memory) -> usize {
-    let output = match std::process::Command::new("pdftotext")
-        .args([
-            "-layout",
-            &path.to_string_lossy(),
-            "-", // output to stdout
-        ])
-        .output()
-    {
+/// Deliberately takes no `&Memory`: this is the only `.await` in profile
+/// loading, and keeping it free of the memory lock means the caller can
+/// run it before taking the lock to do the (synchronous) fact-extraction
+/// and storage in [`ingest_pdf_text`].
+pub async fn extract_pdf_text(path: &Path) -> Option<String> {
+    let mut command = tokio::process::Command::new("pdftotext");
+    command.args([
+        "-layout",
+        &path.to_string_lossy(),
+        "-", // output to stdout
+    ]);
+
+    let output = match subprocess::run_with_timeout(&mut command, PDF_EXTRACT_TIMEOUT).await {
         Ok(o) => o,
-        Err(e) => {
+        Err(SubprocessError::Timeout(d)) => {
+            tracing::warn!(
+                path = %path.display(),
+                timeout = ?d,
+                "pdftotext timed out — skipping this file"
+            );
+            return None;
+        }
+        Err(SubprocessError::Io(e)) => {
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
                 "pdftotext not found — install poppler-utils: sudo apt install poppler-utils"
             );
-            return 0;
+            return None;
         }
     };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::warn!(path = %path.display(), error = %stderr, "pdftotext failed");
-        return 0;
+        return None;
     }
 
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
-    let filename = path.file_name().unwrap_or_default().to_string_lossy();
-    ingest_text(&text, &filename, memory)
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Run pattern extraction on already-extracted PDF text and store any new
+/// facts in `memory`. Split from [`extract_pdf_text`] so the subprocess
+/// call (async, no lock held) and the memory writes (synchronous, lock
+/// held) can run as two separate steps.
+pub fn ingest_pdf_text(text: &str, filename: &str, memory: &Memory) -> usize {
+    ingest_text(text, filename, memory)
 }
 
 /// Core text ingestion: split into chunks, extract facts, deduplicate, store.
@@ -341,5 +369,27 @@ mod tests {
     fn split_sentences_basic() {
         let sentences = split_sentences("Hello world. How are you? I'm fine!");
         assert_eq!(sentences.len(), 3);
+    }
+
+    /// `pdftotext` fails fast (non-zero exit) on a path that doesn't exist —
+    /// this must surface as `None`, not a panic or a hang.
+    #[tokio::test]
+    async fn extract_pdf_text_returns_none_for_missing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "geniepod-ingest-missing-{}.pdf",
+            std::process::id()
+        ));
+        let text = extract_pdf_text(&path).await;
+        assert!(text.is_none());
+    }
+
+    /// The synchronous half of PDF ingestion (post-extraction) behaves the
+    /// same as `ingest_text` — split from the subprocess call, but not
+    /// reimplemented.
+    #[test]
+    fn ingest_pdf_text_stores_facts() {
+        let mem = temp_memory();
+        let count = ingest_pdf_text("My name is Priya. I live in Austin.", "resume.pdf", &mem);
+        assert!(count >= 2, "expected >= 2 facts, got {}", count);
     }
 }

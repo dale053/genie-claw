@@ -1,7 +1,38 @@
 use anyhow::Result;
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
+
+use genie_common::subprocess;
+
+/// Deadline for a one-shot Piper synthesis call (`synthesize_only` /
+/// `synthesize_to_file`). Piper synthesizes much faster than real-time, so
+/// this comfortably covers any single spoken reply while still catching a
+/// wedged subprocess instead of hanging the voice loop forever.
+const PIPER_SYNTHESIS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Safety margin added on top of a PCM buffer's own playback duration when
+/// waiting for `aplay` to exit — covers ALSA device-open/buffering
+/// overhead without needing a flat cap that would kill a legitimately long
+/// spoken reply partway through.
+const APLAY_MARGIN: Duration = Duration::from_secs(10);
+
+/// Flat deadline for `play_wav`, which plays an already-recorded file
+/// (chimes, prompts) of unknown-but-bounded duration rather than a live
+/// PCM buffer whose length — and therefore expected playback time — is
+/// known up front.
+const PLAY_WAV_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Expected `aplay` runtime for `pcm_len` bytes of 16-bit mono PCM at
+/// `sample_rate`, plus [`APLAY_MARGIN`] for ALSA startup/buffering
+/// overhead. Scales with the audio itself so long spoken replies aren't
+/// killed partway through by a flat cap.
+fn aplay_timeout(pcm_len: usize, sample_rate: u32) -> Duration {
+    let bytes_per_second = (sample_rate as f64) * 2.0; // S16_LE mono
+    let playback_secs = pcm_len as f64 / bytes_per_second.max(1.0);
+    Duration::from_secs_f64(playback_secs) + APLAY_MARGIN
+}
 
 /// Phase markers for the first-voice-reply latency banner (issue #19).
 ///
@@ -206,12 +237,13 @@ impl TtsEngine {
                 "starting Piper TTS subprocess"
             );
 
-            let child = Command::new(&self.piper_path)
+            let mut command = Command::new(&self.piper_path);
+            command
                 .args(["--model", &self.model_path, "--output_raw"])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()?;
+                .stderr(std::process::Stdio::null());
+            let child = subprocess::spawn_killable(&mut command)?;
 
             self.child = Some(child);
             tracing::info!("Piper TTS subprocess started (pipe mode)");
@@ -278,19 +310,20 @@ impl TtsEngine {
         let clean = text.replace('\n', " ");
         tracing::debug!(text_len = text.len(), "synthesizing via Piper");
 
-        let mut piper = Command::new(&self.piper_path)
+        let mut command = Command::new(&self.piper_path);
+        command
             .args(["--model", &self.model_path, "--output_raw"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .stderr(std::process::Stdio::piped());
+        let mut piper = subprocess::spawn_killable(&mut command)?;
 
         if let Some(mut stdin) = piper.stdin.take() {
             stdin.write_all(clean.as_bytes()).await?;
             stdin.write_all(b"\n").await?;
         }
 
-        let out = piper.wait_with_output().await?;
+        let out = subprocess::wait_with_output_and_timeout(piper, PIPER_SYNTHESIS_TIMEOUT).await?;
         if !out.status.success() {
             anyhow::bail!("Piper failed: {}", String::from_utf8_lossy(&out.stderr));
         }
@@ -323,19 +356,22 @@ impl TtsEngine {
         }
         aplay_args.extend_from_slice(&["-f", "S16_LE", "-r", &rate_str, "-c", "1", "-t", "raw"]);
 
-        let mut aplay = Command::new("aplay")
+        let mut command = Command::new("aplay");
+        command
             .args(&aplay_args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .stderr(std::process::Stdio::piped());
+        let mut aplay = subprocess::spawn_killable(&mut command)?;
 
         if let Some(mut stdin) = aplay.stdin.take() {
             mark_first_audio();
             stdin.write_all(pcm).await?;
         }
 
-        let status = aplay.wait().await?;
+        let status =
+            subprocess::wait_with_timeout(&mut aplay, aplay_timeout(pcm.len(), self.sample_rate))
+                .await?;
         if !status.success() {
             tracing::warn!("aplay exited with error");
         }
@@ -367,16 +403,15 @@ impl TtsEngine {
 
         let clean = text.replace('\'', "'\\''");
 
-        let output = Command::new("sh")
-            .args([
-                "-c",
-                &format!(
-                    "echo '{}' | '{}' --model '{}' --output_file '{}'",
-                    clean, self.piper_path, self.model_path, output_path,
-                ),
-            ])
-            .output()
-            .await?;
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "echo '{}' | '{}' --model '{}' --output_file '{}'",
+                clean, self.piper_path, self.model_path, output_path,
+            ),
+        ]);
+        let output = subprocess::run_with_timeout(&mut command, PIPER_SYNTHESIS_TIMEOUT).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -496,18 +531,19 @@ pub async fn play_pcm(pcm: &[u8], sample_rate: u32, audio_device: &str) -> Resul
         args.insert(1, audio_device.to_string());
     }
 
-    let mut child = Command::new("aplay")
+    let mut command = Command::new("aplay");
+    command
         .args(&args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    let mut child = subprocess::spawn_killable(&mut command)?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(pcm).await?;
     }
 
-    child.wait().await?;
+    subprocess::wait_with_timeout(&mut child, aplay_timeout(pcm.len(), sample_rate)).await?;
     Ok(())
 }
 
@@ -520,7 +556,9 @@ pub async fn play_wav(wav_path: &str, audio_device: &str) -> Result<()> {
         args.insert(1, audio_device.to_string());
     }
 
-    let output = Command::new("aplay").args(&args).output().await?;
+    let mut command = Command::new("aplay");
+    command.args(&args);
+    let output = subprocess::run_with_timeout(&mut command, PLAY_WAV_TIMEOUT).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -532,6 +570,52 @@ pub async fn play_wav(wav_path: &str, audio_device: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aplay_timeout_scales_with_pcm_duration_plus_margin() {
+        // 22050 Hz, S16_LE mono = 44100 bytes/sec. 4 seconds of audio.
+        let four_seconds_of_pcm = 22050 * 2 * 4;
+        let timeout = aplay_timeout(four_seconds_of_pcm, 22050);
+        assert_eq!(timeout, Duration::from_secs(4) + APLAY_MARGIN);
+    }
+
+    #[test]
+    fn aplay_timeout_is_just_the_margin_for_empty_pcm() {
+        assert_eq!(aplay_timeout(0, 22050), APLAY_MARGIN);
+    }
+
+    /// The silent (test-only) engine mode must still short-circuit before
+    /// ever touching a real `aplay` subprocess — a regression check that
+    /// the timeout-guard migration didn't disturb this early return.
+    #[tokio::test]
+    async fn silent_engine_play_pcm_data_never_spawns_aplay() {
+        let engine = TtsEngine::silent();
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), engine.play_pcm_data(&[0u8; 100])).await;
+        assert!(result.is_ok(), "silent engine must return promptly");
+    }
+
+    /// End-to-end against the real `aplay` binary: an invalid ALSA device
+    /// makes `aplay` exit quickly with an error, not hang — `play_pcm_data`
+    /// must surface that as a prompt `Ok(())` (aplay failures are logged,
+    /// not propagated as `Err`, matching pre-existing behavior), well
+    /// inside the computed `aplay_timeout` deadline.
+    #[tokio::test]
+    async fn play_pcm_data_returns_promptly_for_an_invalid_device() {
+        let engine = TtsEngine::configured(
+            "unused-model",
+            "unused-piper",
+            "definitely-not-a-real-alsa-device",
+            true,
+        );
+        let pcm = vec![0u8; 4410]; // 0.1s of 22050Hz S16LE mono
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), engine.play_pcm_data(&pcm)).await;
+        assert!(
+            result.is_ok(),
+            "an invalid device must fail fast, not hang until the aplay_timeout deadline"
+        );
+    }
 
     #[test]
     fn create_pipe_engine() {

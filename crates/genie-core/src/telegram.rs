@@ -10,7 +10,18 @@ use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use zeroize::Zeroizing;
 
+use genie_common::subprocess;
+
 const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
+
+/// Deadline for a one-shot Piper synthesis call (mirrors
+/// `voice::tts::PIPER_SYNTHESIS_TIMEOUT`).
+const PIPER_SYNTHESIS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for an ffmpeg encode/transcode of a single short voice message.
+const FFMPEG_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for one whisper-cli transcription pass (mirrors
+/// `voice::stt::WHISPER_CLI_TIMEOUT`).
+const WHISPER_CLI_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Process-local monotonic counter for telegram tempfile suffixes. Paired
 /// with the PID at every use site so two concurrent voice handlers in the
@@ -510,7 +521,8 @@ impl TelegramApi {
         // the file-mode invocation in voice/tts.rs but kept inline so the
         // adapter doesn't pull in the `voice` Cargo feature.
         let voice_cfg = &self.config.voice;
-        let mut piper = Command::new(&voice_cfg.piper_path)
+        let mut command = Command::new(&voice_cfg.piper_path);
+        command
             .args([
                 "--model",
                 &voice_cfg.piper_model.to_string_lossy(),
@@ -519,8 +531,8 @@ impl TelegramApi {
             ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+            .stderr(std::process::Stdio::piped());
+        let mut piper = subprocess::spawn_killable(&mut command)
             .with_context(|| format!("failed to spawn piper at {:?}", voice_cfg.piper_path))?;
 
         // Newlines confuse Piper; collapse to spaces like voice/tts.rs does.
@@ -534,7 +546,9 @@ impl TelegramApi {
             stdin.write_all(b"\n").await.context("write piper stdin")?;
         }
 
-        let output = piper.wait_with_output().await.context("await piper")?;
+        let output = subprocess::wait_with_output_and_timeout(piper, PIPER_SYNTHESIS_TIMEOUT)
+            .await
+            .context("await piper")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("piper failed: {}", stderr.trim());
@@ -558,25 +572,25 @@ impl TelegramApi {
         // defaults that comfortably fit voice-message reads under the
         // sendVoice 1 MB cap for typical Piper output lengths.
         let voice_cfg = &self.config.voice;
-        let output = Command::new(&voice_cfg.ffmpeg_path)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                wav_path,
-                "-c:a",
-                "libopus",
-                "-b:a",
-                "24k",
-                "-ac",
-                "1",
-                "-f",
-                "ogg",
-                ogg_path,
-            ])
-            .output()
+        let mut command = Command::new(&voice_cfg.ffmpeg_path);
+        command.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            wav_path,
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "24k",
+            "-ac",
+            "1",
+            "-f",
+            "ogg",
+            ogg_path,
+        ]);
+        let output = subprocess::run_with_timeout(&mut command, FFMPEG_TIMEOUT)
             .await
             .with_context(|| format!("failed to spawn ffmpeg at {:?}", voice_cfg.ffmpeg_path))?;
 
@@ -679,23 +693,23 @@ impl TelegramApi {
 
     async fn transcode_to_wav(&self, ogg_path: &str, wav_path: &str) -> Result<()> {
         let ffmpeg = &self.config.voice.ffmpeg_path;
-        let output = Command::new(ffmpeg)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                ogg_path,
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-f",
-                "wav",
-                wav_path,
-            ])
-            .output()
+        let mut command = Command::new(ffmpeg);
+        command.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            ogg_path,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-f",
+            "wav",
+            wav_path,
+        ]);
+        let output = subprocess::run_with_timeout(&mut command, FFMPEG_TIMEOUT)
             .await
             .with_context(|| format!("failed to spawn ffmpeg at {ffmpeg:?}"))?;
 
@@ -791,9 +805,9 @@ impl TelegramApi {
             args.push(lang);
         }
 
-        let output = Command::new(cli)
-            .args(&args)
-            .output()
+        let mut command = Command::new(cli);
+        command.args(&args);
+        let output = subprocess::run_with_timeout(&mut command, WHISPER_CLI_TIMEOUT)
             .await
             .with_context(|| format!("failed to spawn whisper-cli at {cli:?}"))?;
 

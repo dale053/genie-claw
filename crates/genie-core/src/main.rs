@@ -115,11 +115,12 @@ async fn main() -> Result<()> {
         "connectivity subsystem initialized"
     );
 
-    // Load user profile from /opt/geniepod/data/profile/.
+    // Load user profile from /opt/geniepod/data/profile/. `load_profile`
+    // internally takes the memory lock only around its synchronous parts —
+    // its one `.await` (PDF text extraction via `pdftotext`) runs with no
+    // lock held, so it can't stall any other memory access while running.
     let profile_dir = config.data_dir.join("profile");
-    match memory::with_shared_memory(&memory, |mem| {
-        genie_core::profile::load_profile(&profile_dir, mem)
-    }) {
+    match genie_core::profile::load_profile(&profile_dir, &memory).await {
         Ok(report) if report.total() > 0 => {
             tracing::info!(
                 toml = report.toml_facts,

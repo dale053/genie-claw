@@ -1,7 +1,15 @@
+use std::time::Duration;
+
+use genie_common::subprocess;
 use genie_common::tegrastats::{self, TegraSnapshot};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::watch;
+
+/// Deadline for reaping the `tegrastats` child after its stdout stream
+/// ends. By that point the process is expected to already be exiting; this
+/// only guards against it somehow lingering instead of a genuine hang.
+const TEGRASTATS_REAP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Spawn `tegrastats` as a child process, parse each line, and broadcast
 /// the latest snapshot via a watch channel.
@@ -11,12 +19,13 @@ use tokio::sync::watch;
 ///
 /// On non-Jetson systems (dev), returns None and logs a warning.
 pub async fn spawn(interval_ms: u64) -> Option<watch::Receiver<TegraSnapshot>> {
-    let result = Command::new("tegrastats")
+    let mut command = Command::new("tegrastats");
+    command
         .arg("--interval")
         .arg(interval_ms.to_string())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    let result = subprocess::spawn_killable(&mut command);
 
     let mut child = match result {
         Ok(c) => c,
@@ -68,7 +77,7 @@ pub async fn spawn(interval_ms: u64) -> Option<watch::Receiver<TegraSnapshot>> {
         }
 
         // If tegrastats exits, try to reap the child.
-        let _ = child.wait().await;
+        let _ = subprocess::wait_with_timeout(&mut child, TEGRASTATS_REAP_TIMEOUT).await;
         tracing::warn!("tegrastats process exited");
     });
 

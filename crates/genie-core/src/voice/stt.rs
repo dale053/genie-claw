@@ -1,9 +1,36 @@
 use anyhow::Result;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+
+use genie_common::subprocess;
+
+/// Deadline for the drop-caches shell-out before whisper-cli (a quick
+/// `sync` + sysctl write; if this hangs, something is badly wrong with the
+/// host and it's better to skip it than block transcription indefinitely).
+const DROP_CACHES_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Deadline for one whisper-cli transcription pass (including the CPU
+/// fallback retry). Generous enough for a slower CPU-only run on a
+/// multi-second utterance, while still catching a wedged process instead
+/// of wedging the entire voice loop.
+const WHISPER_CLI_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Deadline for a single sox preprocessing stage (downmix/bandpass/
+/// noisered/compand/normalize) over a short captured utterance.
+const SOX_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deadline for the DeepFilterNet neural denoise pass — slower than sox's
+/// DSP stages, but still bounded well below a full voice-cycle timeout.
+const DEEP_FILTER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Safety margin added on top of `arecord`'s requested capture duration —
+/// covers ALSA device-open overhead without needing a flat cap that would
+/// cut off a legitimately long recording.
+const ARECORD_MARGIN: Duration = Duration::from_secs(10);
 
 /// Monotonic per-process counter for unique temp-file suffixes. Pairs with
 /// the PID so two concurrent `transcribe_pcm` calls in the same process
@@ -219,7 +246,8 @@ impl SttEngine {
         if let SttMode::Server { port } = self.mode {
             tracing::info!(port, model = %self.model_path, "starting whisper server");
 
-            let child = Command::new(&self.cli_path)
+            let mut command = Command::new(&self.cli_path);
+            command
                 .args([
                     "--model",
                     &self.model_path,
@@ -231,8 +259,8 @@ impl SttEngine {
                     "2",
                 ])
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .spawn()?;
+                .stderr(std::process::Stdio::piped());
+            let child = subprocess::spawn_killable(&mut command)?;
 
             self.child = Some(child);
 
@@ -383,13 +411,12 @@ impl SttEngine {
         tracing::info!(cli = %self.cli_path, model = %self.model_path, file = wav_path, "running whisper-cli");
 
         // Drop page cache before CUDA allocation — NvMap needs contiguous blocks.
-        let _ = Command::new("sh")
-            .args([
-                "-c",
-                "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null",
-            ])
-            .output()
-            .await;
+        let mut drop_caches = Command::new("sh");
+        drop_caches.args([
+            "-c",
+            "sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null",
+        ]);
+        let _ = subprocess::run_with_timeout(&mut drop_caches, DROP_CACHES_TIMEOUT).await;
 
         let mut args = vec![
             "-m".to_string(),
@@ -417,7 +444,9 @@ impl SttEngine {
             args.push("--no-gpu".to_string());
         }
 
-        let output = Command::new(&self.cli_path).args(&args).output().await?;
+        let mut command = Command::new(&self.cli_path);
+        command.args(&args);
+        let output = subprocess::run_with_timeout(&mut command, WHISPER_CLI_TIMEOUT).await?;
 
         // If GPU allocation fails (NvMap error), retry with --no-gpu.
         if !output.status.success() && !self.no_gpu {
@@ -431,7 +460,10 @@ impl SttEngine {
                     stderr.lines().next().unwrap_or("")
                 );
                 args.push("--no-gpu".to_string());
-                let retry = Command::new(&self.cli_path).args(&args).output().await?;
+                let mut retry_command = Command::new(&self.cli_path);
+                retry_command.args(&args);
+                let retry =
+                    subprocess::run_with_timeout(&mut retry_command, WHISPER_CLI_TIMEOUT).await?;
                 if !retry.status.success() {
                     let stderr2 = String::from_utf8_lossy(&retry.stderr);
                     anyhow::bail!("whisper-cli failed (CPU retry): {}", stderr2);
@@ -550,23 +582,24 @@ pub async fn flush_mic_buffer(device: &str, sample_rate: u32) {
     // Tegra/LyraT plughw stack returns samples in half real time, so a 1 s
     // mono flush actually drains only ~0.5 s of pending audio. Stereo keeps
     // arecord properly throttled.
-    let _ = Command::new("arecord")
-        .args([
-            "-D",
-            device,
-            "-q",
-            "-f",
-            "S16_LE",
-            "-r",
-            &sample_rate.to_string(),
-            "-c",
-            "2",
-            "-d",
-            "1",
-            &flush_path,
-        ])
-        .output()
-        .await;
+    let mut command = Command::new("arecord");
+    command.args([
+        "-D",
+        device,
+        "-q",
+        "-f",
+        "S16_LE",
+        "-r",
+        &sample_rate.to_string(),
+        "-c",
+        "2",
+        "-d",
+        "1",
+        &flush_path,
+    ]);
+    // 1s of requested capture + margin — see ARECORD_MARGIN.
+    let _ =
+        subprocess::run_with_timeout(&mut command, Duration::from_secs(1) + ARECORD_MARGIN).await;
     let _ = tokio::fs::remove_file(&flush_path).await;
 }
 
@@ -638,22 +671,25 @@ pub async fn record_audio(
     // and the recorded audio is timing-distorted. Capturing native stereo
     // and downmixing to mono in the sox stage below gives clean 3-second
     // real-time captures with correct sample timing.
-    let output = Command::new("arecord")
-        .args([
-            "-D",
-            device,
-            "-f",
-            "S16_LE",
-            "-r",
-            &sample_rate.to_string(),
-            "-c",
-            "2",
-            "-d",
-            &duration_secs.to_string(),
-            &wav_path,
-        ])
-        .output()
-        .await?;
+    let mut command = Command::new("arecord");
+    command.args([
+        "-D",
+        device,
+        "-f",
+        "S16_LE",
+        "-r",
+        &sample_rate.to_string(),
+        "-c",
+        "2",
+        "-d",
+        &duration_secs.to_string(),
+        &wav_path,
+    ]);
+    let output = subprocess::run_with_timeout(
+        &mut command,
+        Duration::from_secs(duration_secs as u64) + ARECORD_MARGIN,
+    )
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -765,7 +801,7 @@ async fn run_sox_chain(
     sox_cmd.args(["compand", "0.02,0.20", "-50,-50,-25,-12,-5,-5", "-2"]);
     sox_cmd.args(["gain", "-n", "-3"]);
 
-    match sox_cmd.output().await {
+    match subprocess::run_with_timeout(&mut sox_cmd, SOX_TIMEOUT).await {
         Ok(out)
             if out.status.success()
                 && tokio::fs::metadata(normalized_path)
@@ -790,7 +826,7 @@ async fn run_sox_chain(
             Ok(wav_path.to_string())
         }
         Err(e) => {
-            tracing::warn!(error = %e, "sox not available; using raw recording (install sox for better STT accuracy on quiet captures)");
+            tracing::warn!(error = %e, "sox unavailable or timed out; using raw recording (install sox for better STT accuracy on quiet captures)");
             Ok(wav_path.to_string())
         }
     }
@@ -839,14 +875,14 @@ async fn run_deepfilternet_chain(
     }
 
     // Stage 1: stereo → mono + bandpass.
-    let stage1 = Command::new("sox")
+    let mut stage1_cmd = Command::new("sox");
+    stage1_cmd
         .arg(wav_path)
         .arg(&mono_path)
         .args(["channels", "1"])
         .args(["highpass", "100"])
-        .args(["lowpass", "7000"])
-        .output()
-        .await;
+        .args(["lowpass", "7000"]);
+    let stage1 = subprocess::run_with_timeout(&mut stage1_cmd, SOX_TIMEOUT).await;
     let stage1_ok = matches!(stage1, Ok(ref o) if o.status.success())
         && tokio::fs::metadata(&mono_path)
             .await
@@ -871,12 +907,12 @@ async fn run_deepfilternet_chain(
     // not `--atten-lim` as the current main-branch enhance_wav.rs source
     // suggests.)
     let dfn_start = std::time::Instant::now();
-    let dfn_res = Command::new(binary_path)
+    let mut dfn_cmd = Command::new(binary_path);
+    dfn_cmd
         .arg(&mono_path)
         .args(["-o", &dfn_dir])
-        .args(["--atten-lim-db", &format!("{}", atten_lim_db)])
-        .output()
-        .await;
+        .args(["--atten-lim-db", &format!("{}", atten_lim_db)]);
+    let dfn_res = subprocess::run_with_timeout(&mut dfn_cmd, DEEP_FILTER_TIMEOUT).await;
     let dfn_ok = matches!(dfn_res, Ok(ref o) if o.status.success())
         && tokio::fs::metadata(&dfn_out)
             .await
@@ -901,12 +937,12 @@ async fn run_deepfilternet_chain(
     let dfn_ms = dfn_start.elapsed().as_millis();
 
     // Stage 3: peak-normalize cleaned audio.
-    let stage3 = Command::new("sox")
+    let mut stage3_cmd = Command::new("sox");
+    stage3_cmd
         .arg(&dfn_out)
         .arg(normalized_path)
-        .args(["gain", "-n", "-3"])
-        .output()
-        .await;
+        .args(["gain", "-n", "-3"]);
+    let stage3 = subprocess::run_with_timeout(&mut stage3_cmd, SOX_TIMEOUT).await;
     let stage3_ok = matches!(stage3, Ok(ref o) if o.status.success())
         && tokio::fs::metadata(normalized_path)
             .await
@@ -1049,6 +1085,59 @@ mod tests {
             assert!(tokio::fs::metadata(&path).await.is_ok());
         }
         assert!(tokio::fs::metadata(&path).await.is_err());
+    }
+
+    /// `sox` is not installed in this test environment, so `run_sox_chain`
+    /// must hit its spawn-failure fallback path (bounded by `SOX_TIMEOUT`,
+    /// not a hang) and return the raw recording untouched.
+    #[tokio::test]
+    async fn run_sox_chain_falls_back_to_raw_wav_when_sox_is_unavailable() {
+        let pid = std::process::id();
+        let wav_path = format!("/tmp/geniepod-stt-soxtest-{pid}.wav");
+        let normalized_path = format!("/tmp/geniepod-stt-soxtest-{pid}-norm.wav");
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_sox_chain(&wav_path, &normalized_path, None),
+        )
+        .await
+        .expect("must not hang waiting on a missing sox binary")
+        .expect("falls back to Ok(wav_path) rather than erroring");
+        assert_eq!(result, wav_path);
+    }
+
+    /// An invalid ALSA device makes `arecord` exit with an error quickly —
+    /// `flush_mic_buffer` must swallow that (best-effort) well inside its
+    /// timeout, not hang until the deadline.
+    #[tokio::test]
+    async fn flush_mic_buffer_returns_promptly_for_an_invalid_device() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            flush_mic_buffer("definitely-not-a-real-alsa-device", 16000),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "an invalid device must fail fast, not hang until the arecord timeout"
+        );
+    }
+
+    /// Same as above for `record_audio`'s main capture call: an invalid
+    /// device must surface as a prompt `Err`, not a hang until
+    /// `duration_secs + ARECORD_MARGIN`.
+    #[tokio::test]
+    async fn record_audio_fails_promptly_for_an_invalid_device() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            record_audio(
+                "definitely-not-a-real-alsa-device",
+                16000,
+                3,
+                Denoiser::None,
+            ),
+        )
+        .await
+        .expect("must not hang past the outer 10s test bound");
+        assert!(result.is_err(), "an invalid device must fail, not succeed");
     }
 
     #[test]

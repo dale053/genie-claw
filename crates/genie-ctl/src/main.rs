@@ -30,6 +30,12 @@
 use anyhow::{Context, Result};
 use genie_common::config::{Config, ServiceProbeTarget, parse_service_probe_target};
 use genie_common::probe::{ProbeTimeouts, probe_service_target};
+use genie_common::subprocess;
+
+/// Deadline for the GitHub Releases version check (`genie-ctl update check`).
+const UPDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Deadline for a `df` disk-usage query.
+const DF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 use genie_core::skills::{
     SkillLoader, SkillManifestAudit, find_manifest_sidecar, manifest_sidecar_candidates,
     skills_dir as runtime_skills_dir,
@@ -2017,17 +2023,18 @@ async fn cmd_update_check() -> Result<()> {
     println!("Checking for updates...\n");
 
     // Check GitHub Releases via curl (handles TLS).
-    let output = tokio::process::Command::new("curl")
-        .args([
-            "-sS",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "User-Agent: GeniePod-OTA",
-            "https://api.github.com/repos/GeniePod/genie-claw/releases/latest",
-        ])
-        .output()
-        .await;
+    let mut command = tokio::process::Command::new("curl");
+    command.args([
+        "-sS",
+        "--max-time",
+        &UPDATE_CHECK_TIMEOUT.as_secs().to_string(),
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "User-Agent: GeniePod-OTA",
+        "https://api.github.com/repos/GeniePod/genie-claw/releases/latest",
+    ]);
+    let output = subprocess::run_with_timeout(&mut command, UPDATE_CHECK_TIMEOUT).await;
 
     match output {
         Ok(out) if out.status.success() => {
@@ -2191,10 +2198,9 @@ async fn cmd_diag() -> Result<()> {
     }
 
     // Disk.
-    let df = tokio::process::Command::new("df")
-        .args(["-h", "/opt/geniepod"])
-        .output()
-        .await;
+    let mut df_command = tokio::process::Command::new("df");
+    df_command.args(["-h", "/opt/geniepod"]);
+    let df = subprocess::run_with_timeout(&mut df_command, DF_TIMEOUT).await;
     if let Ok(out) = df
         && out.status.success()
     {
@@ -2433,11 +2439,9 @@ fn read_file_lines(path: &str, limit: usize) -> Vec<String> {
 }
 
 async fn disk_summary(path: &str) -> serde_json::Value {
-    match tokio::process::Command::new("df")
-        .args(["-h", path])
-        .output()
-        .await
-    {
+    let mut command = tokio::process::Command::new("df");
+    command.args(["-h", path]);
+    match subprocess::run_with_timeout(&mut command, DF_TIMEOUT).await {
         Ok(out) if out.status.success() => {
             let output = String::from_utf8_lossy(&out.stdout);
             let columns = output
@@ -2667,6 +2671,16 @@ mod tests {
 
     fn default_test_config() -> Config {
         toml::from_str("").expect("default config should parse from empty TOML")
+    }
+
+    /// Regression for the timeout-guard migration: `disk_summary` must
+    /// complete promptly against a real `df` call (`DF_TIMEOUT` is 10s;
+    /// this bounds the test at double that as a generous safety margin).
+    #[tokio::test]
+    async fn disk_summary_completes_promptly() {
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(20), disk_summary("/")).await;
+        assert!(result.is_ok(), "must not hang past a 20s bound");
     }
 
     fn expect_probe_target(target: &ServiceProbeTarget) -> (&str, &str, bool) {

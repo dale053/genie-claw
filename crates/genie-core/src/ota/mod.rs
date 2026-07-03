@@ -1,6 +1,12 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use genie_common::subprocess;
+
+/// Deadline for a single GitHub API request via `curl`.
+const GITHUB_API_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// OTA update system for GeniePod.
 ///
@@ -288,17 +294,21 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
 /// Uses curl for TLS — available on all Jetson images.
 async fn github_api_get(path: &str) -> Result<String> {
     let url = format!("https://api.github.com{}", path);
-    let output = tokio::process::Command::new("curl")
-        .args([
-            "-sS",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "User-Agent: GeniePod-OTA",
-            &url,
-        ])
-        .output()
-        .await?;
+    let mut command = tokio::process::Command::new("curl");
+    command.args([
+        "-sS",
+        "--max-time",
+        &GITHUB_API_TIMEOUT.as_secs().to_string(),
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "User-Agent: GeniePod-OTA",
+        &url,
+    ]);
+    // `--max-time` above bounds curl's own network wait; wrapping in our
+    // own timeout too catches a curl process that hangs before ever
+    // reaching the network (e.g. DNS resolution stalling indefinitely).
+    let output = subprocess::run_with_timeout(&mut command, GITHUB_API_TIMEOUT).await?;
 
     if !output.status.success() {
         anyhow::bail!(

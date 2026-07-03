@@ -1,5 +1,13 @@
 use anyhow::Result;
+use std::time::Duration;
 use tokio::process::Command;
+
+use genie_common::subprocess;
+
+/// Deadline for a single `systemctl`/`docker` control command. Generous
+/// enough for a slow service stop/restart, while still catching a wedged
+/// systemd or Docker daemon instead of blocking the governor forever.
+const SERVICE_CTL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Control systemd and Docker services.
 ///
@@ -11,10 +19,9 @@ impl ServiceCtl {
     /// Start a systemd unit.
     pub async fn start(unit: &str) -> Result<()> {
         tracing::info!(unit, "starting service");
-        let output = Command::new("systemctl")
-            .args(["start", unit])
-            .output()
-            .await?;
+        let mut command = Command::new("systemctl");
+        command.args(["start", unit]);
+        let output = subprocess::run_with_timeout(&mut command, SERVICE_CTL_TIMEOUT).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -27,10 +34,9 @@ impl ServiceCtl {
     /// Stop a systemd unit.
     pub async fn stop(unit: &str) -> Result<()> {
         tracing::info!(unit, "stopping service");
-        let output = Command::new("systemctl")
-            .args(["stop", unit])
-            .output()
-            .await?;
+        let mut command = Command::new("systemctl");
+        command.args(["stop", unit]);
+        let output = subprocess::run_with_timeout(&mut command, SERVICE_CTL_TIMEOUT).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -46,9 +52,9 @@ impl ServiceCtl {
 
     /// Check if a systemd unit is active.
     pub async fn is_active(unit: &str) -> bool {
-        Command::new("systemctl")
-            .args(["is-active", "--quiet", unit])
-            .status()
+        let mut command = Command::new("systemctl");
+        command.args(["is-active", "--quiet", unit]);
+        subprocess::status_with_timeout(&mut command, SERVICE_CTL_TIMEOUT)
             .await
             .map(|s| s.success())
             .unwrap_or(false)
@@ -57,10 +63,9 @@ impl ServiceCtl {
     /// Stop a Docker container by name.
     pub async fn docker_stop(container: &str) -> Result<()> {
         tracing::info!(container, "stopping Docker container");
-        let output = Command::new("docker")
-            .args(["stop", "-t", "10", container])
-            .output()
-            .await?;
+        let mut command = Command::new("docker");
+        command.args(["stop", "-t", "10", container]);
+        let output = subprocess::run_with_timeout(&mut command, SERVICE_CTL_TIMEOUT).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -75,10 +80,9 @@ impl ServiceCtl {
     #[allow(dead_code)]
     pub async fn docker_start(container: &str) -> Result<()> {
         tracing::info!(container, "starting Docker container");
-        let output = Command::new("docker")
-            .args(["start", container])
-            .output()
-            .await?;
+        let mut command = Command::new("docker");
+        command.args(["start", container]);
+        let output = subprocess::run_with_timeout(&mut command, SERVICE_CTL_TIMEOUT).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -112,20 +116,18 @@ impl ServiceCtl {
         // silently (polkit denial, masked unit, rejected override) — a swallowed
         // failure here leaves the heavier model resident and risks OOM, so we
         // check the exit status and bail like the other state-changing methods.
-        let output = Command::new("systemctl")
-            .args(["daemon-reload"])
-            .output()
-            .await?;
+        let mut daemon_reload = Command::new("systemctl");
+        daemon_reload.args(["daemon-reload"]);
+        let output = subprocess::run_with_timeout(&mut daemon_reload, SERVICE_CTL_TIMEOUT).await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::warn!(unit = %unit, %stderr, "systemctl daemon-reload failed");
             anyhow::bail!("systemctl daemon-reload failed: {}", stderr);
         }
 
-        let output = Command::new("systemctl")
-            .args(["restart", &unit])
-            .output()
-            .await?;
+        let mut restart = Command::new("systemctl");
+        restart.args(["restart", &unit]);
+        let output = subprocess::run_with_timeout(&mut restart, SERVICE_CTL_TIMEOUT).await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::warn!(unit = %unit, %stderr, "failed to restart LLM service");
@@ -147,7 +149,9 @@ impl ServiceCtl {
             mkswap /dev/zram0 2>/dev/null
             swapon -p 5 /dev/zram0 2>/dev/null
         "#;
-        let output = Command::new("sh").args(["-c", script]).output().await?;
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        let output = subprocess::run_with_timeout(&mut command, SERVICE_CTL_TIMEOUT).await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::warn!(%stderr, "zram setup may have partially failed");
@@ -187,5 +191,27 @@ mod tests {
             llm_override_dir_for_unit("genie-ai-runtime.service"),
             "/etc/systemd/system/genie-ai-runtime.service.d"
         );
+    }
+
+    /// End-to-end against the real `systemctl` binary: a nonexistent unit
+    /// must resolve quickly (`false`), not hang until `SERVICE_CTL_TIMEOUT`.
+    ///
+    /// Note: `systemctl start`/`stop`/`restart` against this sandbox's
+    /// non-running systemd manager actually does hang rather than failing
+    /// fast (confirmed manually) — real, live evidence of the exact bug
+    /// this fix addresses. That path isn't unit-tested here since
+    /// `SERVICE_CTL_TIMEOUT` is intentionally generous (30s) and a test
+    /// that waits it out would meaningfully slow the full suite; the
+    /// kill-on-timeout mechanism itself is already covered deterministically
+    /// (and quickly) by `genie_common::subprocess`'s own tests.
+    #[tokio::test]
+    async fn is_active_returns_promptly_for_a_nonexistent_unit() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            ServiceCtl::is_active("definitely-not-a-real-unit-xyz.service"),
+        )
+        .await
+        .expect("must not hang past a 10s bound");
+        assert!(!result);
     }
 }

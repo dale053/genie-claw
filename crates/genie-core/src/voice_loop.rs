@@ -10,8 +10,18 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+
+use genie_common::subprocess;
+
+/// Deadline for `detect-audio-device.sh` — a quick ALSA card scan.
+const DETECT_AUDIO_DEVICE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Deadline for the wake-tone chime's `aplay` playback (~150ms of audio;
+/// generous margin for ALSA device-open overhead).
+const WAKE_TONE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Whether the first-voice-reply latency banner (issue #19) has been printed
 /// this process. Set true after the first successful voice cycle so subsequent
@@ -219,13 +229,13 @@ async fn run_with_wakeword(
     loop {
         eprintln!("[voice] Starting wake word listener...");
 
-        let mut child = match Command::new("python3")
+        let mut wakeword_command = Command::new("python3");
+        wakeword_command
             .args([&voice_cfg.wakeword_script, "--threshold", "0.3"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
+            .stderr(std::process::Stdio::null());
+        let mut child = match subprocess::spawn_killable(&mut wakeword_command) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[voice] Failed to start wake word listener: {}", e);
@@ -563,7 +573,9 @@ async fn detect_audio_output_device() -> Option<String> {
     if tokio::fs::metadata(DETECT_SCRIPT).await.is_ok() {
         // Pass --output so the script returns a sink-suitable device
         // (skipping LyraT/APE which our firmware leaves capture-only).
-        match Command::new(DETECT_SCRIPT).arg("--output").output().await {
+        let mut command = Command::new(DETECT_SCRIPT);
+        command.arg("--output");
+        match subprocess::run_with_timeout(&mut command, DETECT_AUDIO_DEVICE_TIMEOUT).await {
             Ok(out) if out.status.success() => {
                 let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !dev.is_empty() {
@@ -605,7 +617,8 @@ async fn detect_audio_device() -> Option<String> {
     const DETECT_SCRIPT: &str = "/opt/geniepod/bin/detect-audio-device.sh";
 
     if tokio::fs::metadata(DETECT_SCRIPT).await.is_ok() {
-        match Command::new(DETECT_SCRIPT).output().await {
+        let mut command = Command::new(DETECT_SCRIPT);
+        match subprocess::run_with_timeout(&mut command, DETECT_AUDIO_DEVICE_TIMEOUT).await {
             Ok(out) if out.status.success() => {
                 let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !dev.is_empty() {
@@ -852,18 +865,19 @@ async fn play_wake_tone(audio_device: &str) {
     }
     args.extend_from_slice(&["-f", "S16_LE", "-r", "22050", "-c", "1", "-t", "raw"]);
 
-    let child = Command::new("aplay")
+    let mut command = Command::new("aplay");
+    command
         .args(&args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    let child = subprocess::spawn_killable(&mut command);
 
     if let Ok(mut child) = child {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = tokio::io::AsyncWriteExt::write_all(&mut stdin, &pcm).await;
         }
-        let _ = child.wait().await;
+        let _ = subprocess::wait_with_timeout(&mut child, WAKE_TONE_TIMEOUT).await;
     }
 }
 
@@ -1347,5 +1361,35 @@ mod tests {
 
         assert!(!unreachable.contains("llama-server"));
         assert!(!unreachable.contains("llama.cpp"));
+    }
+
+    /// Regression for the timeout-guard migration: even without
+    /// `/opt/geniepod/bin/detect-audio-device.sh` present (the common case
+    /// off-device), detection must return well inside a generous bound,
+    /// not hang.
+    #[tokio::test]
+    async fn detect_audio_device_completes_promptly() {
+        let result = tokio::time::timeout(Duration::from_secs(10), detect_audio_device()).await;
+        assert!(result.is_ok(), "must not hang past a 10s bound");
+    }
+
+    #[tokio::test]
+    async fn detect_audio_output_device_completes_promptly() {
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), detect_audio_output_device()).await;
+        assert!(result.is_ok(), "must not hang past a 10s bound");
+    }
+
+    /// The chime uses a real `aplay` call with a possibly-invalid device in
+    /// test environments — it must still return promptly rather than
+    /// hanging until `WAKE_TONE_TIMEOUT`.
+    #[tokio::test]
+    async fn play_wake_tone_completes_promptly() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            play_wake_tone("definitely-not-a-real-alsa-device"),
+        )
+        .await;
+        assert!(result.is_ok(), "must not hang past a 10s bound");
     }
 }
