@@ -967,7 +967,7 @@ async fn handle_chat_stream(
 
     conversations.ensure(&conv_id, "New conversation").await?;
     conversations
-        .append(&conv_id, "user", user_text, None)
+        .append(&conv_id, "user", user_text, None, None)
         .await?;
 
     if let Some(call) = crate::tools::quick::route_for_available_tools(
@@ -1172,7 +1172,7 @@ async fn handle_chat_stream(
             state.emitted_text = true;
         }
         conversations
-            .append_or_log(&conv_id, "assistant", &sanitized, None)
+            .append_or_log(&conv_id, "assistant", &sanitized, None, None)
             .await;
         sanitized
     };
@@ -1213,7 +1213,7 @@ pub async fn process_chat_turn(
 ) -> Result<ChatTurnResult> {
     conversations.ensure(conv_id, "New conversation").await?;
     conversations
-        .append(conv_id, "user", user_text, None)
+        .append(conv_id, "user", user_text, None, None)
         .await?;
 
     if let Some(call) = crate::tools::quick::route_for_available_tools(
@@ -1371,7 +1371,7 @@ pub async fn process_chat_turn(
             crate::security::sandbox::sanitize_output(&llm_response)
         };
         conversations
-            .append_or_log(conv_id, "assistant", &sanitized, None)
+            .append_or_log(conv_id, "assistant", &sanitized, None, None)
             .await;
         sanitized
     };
@@ -1438,13 +1438,20 @@ async fn finalize_direct_tool_turn(
     })
     .to_string();
     conversations
-        .append_or_log(conv_id, "assistant", &tool_json, Some(&tool_result.tool))
+        .append_or_log(
+            conv_id,
+            "assistant",
+            &tool_json,
+            Some(&tool_result.tool),
+            None,
+        )
         .await;
     conversations
         .append_or_log(
             conv_id,
             "system",
             &format!("Tool result: {}", tool_result.output),
+            None,
             None,
         )
         .await;
@@ -1456,7 +1463,7 @@ async fn finalize_direct_tool_turn(
     };
     let sanitized = crate::security::sandbox::sanitize_output(&response);
     conversations
-        .append_or_log(conv_id, "assistant", &sanitized, None)
+        .append_or_log(conv_id, "assistant", &sanitized, None, None)
         .await;
     sanitized
 }
@@ -1470,13 +1477,20 @@ async fn finalize_tool_turn(
     model_family: ModelFamily,
 ) -> String {
     conversations
-        .append_or_log(conv_id, "assistant", llm_response, Some(&tool_result.tool))
+        .append_or_log(
+            conv_id,
+            "assistant",
+            llm_response,
+            Some(&tool_result.tool),
+            None,
+        )
         .await;
     conversations
         .append_or_log(
             conv_id,
             "system",
             &format!("Tool result: {}", tool_result.output),
+            None,
             None,
         )
         .await;
@@ -1511,7 +1525,7 @@ async fn finalize_tool_turn(
     let sanitized_summary = crate::security::sandbox::sanitize_output(&summary);
 
     conversations
-        .append_or_log(conv_id, "assistant", &sanitized_summary, None)
+        .append_or_log(conv_id, "assistant", &sanitized_summary, None, None)
         .await;
     sanitized_summary
 }
