@@ -692,6 +692,18 @@ async fn set_timer_rejects_invalid_arguments_and_audits() {
             serde_json::json!({"seconds": 300.5}),
             "set_timer requires integer argument 'seconds'",
         ),
+        (
+            serde_json::json!({"seconds": 60, "label": 123}),
+            "set_timer 'label' must be a string when provided",
+        ),
+        (
+            serde_json::json!({"seconds": 60, "label": true}),
+            "set_timer 'label' must be a string when provided",
+        ),
+        (
+            serde_json::json!({"seconds": 60, "label": ["pasta"]}),
+            "set_timer 'label' must be a string when provided",
+        ),
     ];
     let expected_audit_count = invalid_calls.len();
 
@@ -1056,6 +1068,14 @@ async fn memory_store_rejects_invalid_arguments_and_audits() {
             serde_json::json!({"content": 123}),
             "memory_store requires non-empty string argument 'content'",
         ),
+        (
+            serde_json::json!({"name": ""}),
+            "memory_store requires non-empty string argument 'content'",
+        ),
+        (
+            serde_json::json!({"name": "   "}),
+            "memory_store requires non-empty string argument 'content'",
+        ),
     ];
     let expected_audit_count = invalid_calls.len();
 
@@ -1098,11 +1118,27 @@ async fn memory_store_rejects_invalid_arguments_and_audits() {
         ok.output
     );
 
+    // The `name` alias path is a valid alternative to `content` (#428 / #416).
+    let name_ok = dispatcher
+        .execute_with_context(
+            &ToolCall {
+                name: "memory_store".into(),
+                arguments: serde_json::json!({"name": "Jared"}),
+            },
+            ctx,
+        )
+        .await;
+    assert!(
+        name_ok.success,
+        "memory_store name alias must succeed, got: {}",
+        name_ok.output
+    );
+
     let events = read_jsonl(&paths.tool_audit);
     assert_eq!(
         events.len(),
-        expected_audit_count + 1,
-        "each rejected call plus the valid one must be tool-audited"
+        expected_audit_count + 2,
+        "each rejected call plus the two valid ones must be tool-audited"
     );
     for event in &events[..expected_audit_count] {
         assert_eq!(event["tool"], "memory_store");
@@ -1110,6 +1146,7 @@ async fn memory_store_rejects_invalid_arguments_and_audits() {
         assert_eq!(event["success"], false);
     }
     assert_eq!(events[expected_audit_count]["success"], true);
+    assert_eq!(events[expected_audit_count + 1]["success"], true);
 }
 
 #[tokio::test]

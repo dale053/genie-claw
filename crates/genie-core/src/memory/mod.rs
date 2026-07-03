@@ -1005,6 +1005,42 @@ impl Memory {
         Ok(self.query_hashes(id)?.len())
     }
 
+    /// Batch form of `query_diversity`: distinct query-shape counts for many
+    /// memory ids in a single query, avoiding the per-id `SELECT query_hashes`
+    /// N+1 in `recall::score_candidates` (up to ~1000 candidates per dream
+    /// cycle). Parsing matches `query_hashes` (`unwrap_or_default`). Ids with no
+    /// row are simply absent from the map; callers default to 0, matching the
+    /// old `query_diversity(id).unwrap_or(0)`.
+    pub fn query_diversity_for_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, usize>> {
+        let mut out = std::collections::HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        // Stay under SQLite's 999 bound-variable limit.
+        const CHUNK: usize = 900;
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT id, query_hashes FROM memories WHERE id IN ({placeholders})");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+                let id: i64 = row.get(0)?;
+                let hashes_json: String = row.get(1)?;
+                Ok((id, hashes_json))
+            })?;
+            for row in rows {
+                let (id, hashes_json) = row?;
+                let count = serde_json::from_str::<Vec<String>>(&hashes_json)
+                    .unwrap_or_default()
+                    .len();
+                out.insert(id, count);
+            }
+        }
+        Ok(out)
+    }
+
     /// Get recent memories for context injection.
     pub fn recent(&self, limit: usize) -> Result<Vec<MemoryEntry>> {
         let mut stmt = self.conn.prepare(
@@ -1088,28 +1124,67 @@ impl Memory {
     }
 
     /// Mark a memory as promoted (moved to permanent storage).
+    ///
+    /// Convenience wrapper around [`mark_promoted_many`](Self::mark_promoted_many)
+    /// for the single-id case; the resulting DB row, MEMORY.md tree, and canonical
+    /// event are identical to promoting a one-element batch.
     pub fn mark_promoted(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute("UPDATE memories SET promoted = 1 WHERE id = ?1", [id])?;
-        if let Some(entry) = self.get_by_id(id)? {
-            let shared_safe = policy::assess_memory_read(
-                entry.metadata,
-                policy::MemoryReadContext::shared_room_voice(),
-            )
-            .allowed;
-            self.rebuild_root_memory_file()?;
-            self.record_canonical_event(MemoryEvent {
-                ts_ms: now_ms(),
-                action: "promote",
-                id: Some(id),
-                kind: Some(entry.kind),
-                content: Some(entry.content),
-                detail: Some(if shared_safe {
-                    "added to MEMORY.md".into()
-                } else {
-                    "promotion retained in DB only; skipped MEMORY.md due to policy".into()
-                }),
-            })?;
+        self.mark_promoted_many(&[id])
+    }
+
+    /// Mark several memories as promoted in one pass.
+    ///
+    /// Applies every `promoted = 1` update and records each promotion's canonical
+    /// event, then rebuilds the canonical MEMORY.md tree exactly once for the
+    /// whole batch. Previously each promotion called
+    /// [`rebuild_root_memory_file`](Self::rebuild_root_memory_file) on its own — a
+    /// full `WHERE promoted = 1` table scan plus a complete rewrite of MEMORY.md,
+    /// INDEX.md, and every namespace file — so a dream cycle promoting P memories
+    /// did P rebuilds when only the final on-disk state is ever observed. Batching
+    /// collapses that to a single rebuild; the resulting DB rows, MEMORY.md tree,
+    /// and per-promotion canonical events are unchanged. Ids that don't resolve to
+    /// a row are skipped (matching the single-id path), and an all-miss batch
+    /// performs no rebuild. Contributes under #402 (performance bucket), the same
+    /// batching pattern as the `prune_decayed` deletes.
+    pub fn mark_promoted_many(&self, ids: &[i64]) -> Result<()> {
+        // Apply each promotion and stage its canonical event. The event detail
+        // depends only on that entry's own policy metadata, not on global state,
+        // so recording the events after a single batch rebuild is equivalent to
+        // recording each one after its own rebuild.
+        let mut events = Vec::new();
+        for &id in ids {
+            self.conn
+                .execute("UPDATE memories SET promoted = 1 WHERE id = ?1", [id])?;
+            if let Some(entry) = self.get_by_id(id)? {
+                let shared_safe = policy::assess_memory_read(
+                    entry.metadata,
+                    policy::MemoryReadContext::shared_room_voice(),
+                )
+                .allowed;
+                events.push(MemoryEvent {
+                    ts_ms: now_ms(),
+                    action: "promote",
+                    id: Some(id),
+                    kind: Some(entry.kind),
+                    content: Some(entry.content),
+                    detail: Some(if shared_safe {
+                        "added to MEMORY.md".into()
+                    } else {
+                        "promotion retained in DB only; skipped MEMORY.md due to policy".into()
+                    }),
+                });
+            }
+        }
+
+        // No id resolved to a real row → nothing observable changed, so skip the
+        // rebuild (the single-id path likewise rebuilt only when the id existed).
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        self.rebuild_root_memory_file()?;
+        for event in events {
+            self.record_canonical_event(event)?;
         }
         Ok(())
     }
@@ -1127,22 +1202,34 @@ impl Memory {
             .filter_map(|r| r.ok())
             .collect();
 
-        let mut deleted = 0;
-        for (id, accessed_ms) in candidates {
-            // Decay from last access (recency-of-use), consistent with search
-            // ranking — a long-unused memory decays and is pruned; a recently
-            // recalled one survives regardless of how long ago it was created.
-            let age_days = (now as f64 - accessed_ms as f64) / 86_400_000.0;
-            let multiplier = decay::exponential_decay(age_days, self.half_life_days);
+        // Decide deletions in Rust (decay math unchanged), then remove them in a
+        // few batched `IN (...)` statements instead of one auto-committed DELETE
+        // per row. Same rows removed and same count returned; the batching is the
+        // same write-coalescing pattern as recall-tracking (#431) and scales with
+        // the number of decayed rows. Contributes under #402 (performance bucket).
+        let to_delete: Vec<i64> = candidates
+            .into_iter()
+            .filter_map(|(id, accessed_ms)| {
+                // Decay from last access (recency-of-use), consistent with search
+                // ranking — a long-unused memory decays and is pruned; a recently
+                // recalled one survives regardless of how long ago it was created.
+                let age_days = (now as f64 - accessed_ms as f64) / 86_400_000.0;
+                let multiplier = decay::exponential_decay(age_days, self.half_life_days);
+                (multiplier < min_decay_threshold).then_some(id)
+            })
+            .collect();
 
-            if multiplier < min_decay_threshold {
-                self.conn
-                    .execute("DELETE FROM memories WHERE id = ?1", [id])?;
-                deleted += 1;
-            }
+        // SQLite's default bound-variable limit is 999; stay safely under it.
+        const DELETE_CHUNK: usize = 900;
+        for chunk in to_delete.chunks(DELETE_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            self.conn.execute(
+                &format!("DELETE FROM memories WHERE id IN ({placeholders})"),
+                params_from_iter(chunk.iter()),
+            )?;
         }
 
-        Ok(deleted)
+        Ok(to_delete.len())
     }
 
     /// Prune memories older than max_age_days (simple cutoff).
@@ -1153,6 +1240,43 @@ impl Memory {
             [cutoff],
         )?;
         Ok(deleted)
+    }
+
+    /// Combined pruning operation for scheduled background runs.
+    ///
+    /// 1. Calls [`prune_decayed`](Self::prune_decayed) with `decay_threshold` to
+    ///    remove entries whose exponential decay multiplier has fallen below the
+    ///    threshold (non-evergreen, non-promoted entries only).
+    /// 2. Calls [`prune_stale`](Self::prune_stale) with `stale_days` to remove
+    ///    entries not accessed within that many days.
+    /// 3. Issues `PRAGMA wal_checkpoint(TRUNCATE)` so freed pages are returned
+    ///    to the OS.
+    ///
+    /// Returns `(decay_pruned, stale_pruned)` row counts.
+    pub fn prune_and_checkpoint(
+        &self,
+        decay_threshold: f64,
+        stale_days: u32,
+    ) -> Result<(usize, usize)> {
+        let decayed = self.prune_decayed(decay_threshold)?;
+        let stale = self.prune_stale(stale_days)?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok((decayed, stale))
+    }
+
+    /// Return the on-disk size of the memory database in bytes, estimated from
+    /// SQLite's `PRAGMA page_count` × `PRAGMA page_size`.
+    pub fn db_size_bytes(&self) -> Option<u64> {
+        let pages: u64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .ok()?;
+        let page_size: u64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .ok()?;
+        Some(pages * page_size)
     }
 
     /// Get all memories of a specific category (e.g. "identity").
@@ -11250,6 +11374,173 @@ mod tests {
     }
 
     #[test]
+    fn query_diversity_for_ids_matches_per_id() {
+        let mem = temp_memory();
+        let cases = [
+            ("[]", 0usize),
+            ("[\"a\"]", 1),
+            ("[\"a\",\"b\",\"c\"]", 3),
+            ("[\"x\",\"y\"]", 2),
+        ];
+        let mut ids = Vec::new();
+        for (json, _) in cases {
+            let id = mem.store("fact", "f").unwrap();
+            mem.conn
+                .execute(
+                    "UPDATE memories SET query_hashes = ?1 WHERE id = ?2",
+                    rusqlite::params![json, id],
+                )
+                .unwrap();
+            ids.push(id);
+        }
+        let batched = mem.query_diversity_for_ids(&ids).unwrap();
+        for (i, (_, expected)) in cases.iter().enumerate() {
+            let id = ids[i];
+            // Batched count matches the expected and the per-id query_diversity.
+            assert_eq!(
+                batched.get(&id).copied().unwrap_or(0),
+                *expected,
+                "batched id {id}"
+            );
+            assert_eq!(mem.query_diversity(id).unwrap(), *expected, "per-id {id}");
+        }
+        // Missing id -> absent (caller defaults to 0); empty input -> empty map.
+        assert!(mem.query_diversity_for_ids(&[999_999]).unwrap().is_empty());
+        assert!(mem.query_diversity_for_ids(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "microbench; run with --ignored --nocapture"]
+    fn bench_query_diversity_batched_vs_n_plus_1() {
+        use std::time::Instant;
+        let n = 500usize;
+        let reps = 20u32;
+
+        let mem = temp_memory();
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = mem.store("fact", &format!("f{i}")).unwrap();
+            mem.conn
+                .execute(
+                    "UPDATE memories SET query_hashes = ?1 WHERE id = ?2",
+                    rusqlite::params![format!("[\"q{i}a\",\"q{i}b\",\"q{i}c\"]"), id],
+                )
+                .unwrap();
+            ids.push(id);
+        }
+
+        // NEW: one batched query.
+        let mut new_total = 0u128;
+        for _ in 0..reps {
+            let t = Instant::now();
+            let m = mem.query_diversity_for_ids(&ids).unwrap();
+            new_total += t.elapsed().as_nanos();
+            assert_eq!(m.len(), n);
+        }
+
+        // OLD: one query_diversity per id (the N+1).
+        let mut old_total = 0u128;
+        for _ in 0..reps {
+            let t = Instant::now();
+            let mut sum = 0usize;
+            for id in &ids {
+                sum += mem.query_diversity(*id).unwrap();
+            }
+            old_total += t.elapsed().as_nanos();
+            assert_eq!(sum, n * 3);
+        }
+
+        let new_ns = new_total / u128::from(reps);
+        let old_ns = old_total / u128::from(reps);
+        eprintln!(
+            "query_diversity over {n} ids: old(N+1) {old_ns} ns -> new(batched) {new_ns} ns ({:.2}x)",
+            old_ns as f64 / new_ns as f64
+        );
+    }
+
+    #[test]
+    fn wal_pruning_path_recovers_after_unclean_shutdown() {
+        // Durability check for the WAL/pruning path (#516/#542): committed writes
+        // and a decayed-prune must survive a process that dies without a clean
+        // close, and the reopened database must pass an integrity check.
+        let path = temp_memory_path("crash-recovery");
+
+        let mem = Memory::open(&path).unwrap();
+        for i in 0..50 {
+            mem.store("fact", &format!("durable fact {i}")).unwrap();
+        }
+        // Age half the rows so the decayed-prune (the chunked IN(...) DELETE from
+        // #542) actually removes them inside the WAL before the crash.
+        mem.conn
+            .execute("UPDATE memories SET accessed_ms = 0 WHERE id % 2 = 0", [])
+            .unwrap();
+        let pruned = mem.prune_decayed(0.5).unwrap();
+        assert!(pruned > 0, "aged rows should have been pruned");
+        let survivors = mem.count().unwrap();
+
+        // Simulate an unclean shutdown: leak the connection so its destructor never
+        // runs, meaning the WAL is never checkpointed or cleanly closed. This is the
+        // state left behind by a killed process or a power loss mid-run.
+        std::mem::forget(mem);
+
+        // Recovery: a fresh connection must replay the committed WAL frames.
+        let recovered = Memory::open(&path).unwrap();
+        let integrity: String = recovered
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "database corrupt after unclean shutdown");
+        assert_eq!(
+            recovered.count().unwrap(),
+            survivors,
+            "committed state not recovered from the WAL"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_serialize_without_corruption() {
+        // WAL mode plus busy_timeout must let several connections write the same
+        // database at once without losing writes or corrupting the file.
+        let path = temp_memory_path("concurrent-write");
+        // Create the schema up front so the writer threads open an existing
+        // database and do not race on first-time migration.
+        {
+            let seed = Memory::open(&path).unwrap();
+            seed.store("fact", "seed").unwrap();
+        }
+
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 25;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    // Each thread owns its own connection; nothing is shared.
+                    let mem = Memory::open(&p).unwrap();
+                    for i in 0..PER_THREAD {
+                        mem.store("fact", &format!("thread {t} write {i}")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mem = Memory::open(&path).unwrap();
+        let integrity: String = mem
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "concurrent writes corrupted the database");
+        assert_eq!(
+            mem.count().unwrap(),
+            1 + THREADS * PER_THREAD,
+            "a concurrent write was lost"
+        );
+    }
+
+    #[test]
     fn search_handles_question_words_and_apostrophes() {
         let mem = temp_memory();
         mem.store("identity", "User's name is Jared").unwrap();
@@ -16723,5 +17014,65 @@ mod tests {
         assert!(!mem.canonical_dir.join("namespaces.tmp").exists());
         assert!(!mem.canonical_dir.join("MEMORY.md.tmp").exists());
         assert!(!mem.canonical_dir.join("INDEX.md.tmp").exists());
+    }
+
+    #[test]
+    #[ignore = "microbench; run with --ignored --nocapture"]
+    fn bench_prune_decayed_batched_vs_per_row() {
+        use std::time::Instant;
+        let n = 400usize;
+        let reps = 20u32;
+
+        fn populate_stale(n: usize) -> Memory {
+            let mem = Memory::open_with_half_life(&temp_memory_path("bench-prune"), 0.001).unwrap();
+            for i in 0..n {
+                mem.store("fact", &format!("decayed fact {i}")).unwrap();
+            }
+            // Force every row stale (epoch access time decays below threshold).
+            mem.conn
+                .execute("UPDATE memories SET accessed_ms = 0", [])
+                .unwrap();
+            mem
+        }
+
+        // NEW: the batched prune_decayed (production fn).
+        let mut new_total = 0u128;
+        for _ in 0..reps {
+            let mem = populate_stale(n);
+            let t = Instant::now();
+            let deleted = mem.prune_decayed(0.5).unwrap();
+            new_total += t.elapsed().as_nanos();
+            assert_eq!(deleted, n, "all stale rows should prune");
+        }
+
+        // OLD: the previous per-row auto-committed DELETE loop, inlined.
+        let mut old_total = 0u128;
+        for _ in 0..reps {
+            let mem = populate_stale(n);
+            let ids: Vec<i64> = {
+                let mut s = mem
+                    .conn
+                    .prepare("SELECT id FROM memories WHERE evergreen = 0 AND promoted = 0")
+                    .unwrap();
+                s.query_map([], |r| r.get::<_, i64>(0))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            };
+            let t = Instant::now();
+            for id in &ids {
+                mem.conn
+                    .execute("DELETE FROM memories WHERE id = ?1", [id])
+                    .unwrap();
+            }
+            old_total += t.elapsed().as_nanos();
+        }
+
+        let new_ns = new_total / u128::from(reps);
+        let old_ns = old_total / u128::from(reps);
+        eprintln!(
+            "prune_decayed deleting {n} rows: old(per-row) {old_ns} ns -> new(batched) {new_ns} ns ({:.2}x)",
+            old_ns as f64 / new_ns as f64
+        );
     }
 }

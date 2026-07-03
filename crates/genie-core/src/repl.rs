@@ -25,7 +25,7 @@ pub async fn run(
     let mut lines = stdin.lines();
 
     // Get or create a REPL conversation.
-    let conv_id = conversations.create()?;
+    let conv_id = conversations.create().await?;
     tracing::info!(conv_id = %conv_id, "REPL conversation started");
 
     let tool_names = tools_dispatch
@@ -63,6 +63,9 @@ pub async fn run(
 
         // Persist user message.
         conversations.append_or_log(&conv_id, "user", text, None, None);
+        conversations
+            .append_or_log(&conv_id, "user", text, None)
+            .await;
 
         if let Some(call) = tools::quick::route_for_available_tools(
             text,
@@ -106,6 +109,20 @@ pub async fn run(
                 None,
             );
             conversations.append_or_log(&conv_id, "assistant", &response, None, None);
+            conversations
+                .append_or_log(&conv_id, "assistant", &tool_json, Some(&tool_result.tool))
+                .await;
+            conversations
+                .append_or_log(
+                    &conv_id,
+                    "system",
+                    &format!("Tool: {}", tool_result.output),
+                    None,
+                )
+                .await;
+            conversations
+                .append_or_log(&conv_id, "assistant", &response, None)
+                .await;
 
             let stored = with_shared_memory(memory, |memory| {
                 memory::extract::extract_and_store(memory, text)
@@ -131,6 +148,7 @@ pub async fn run(
 
         let history = conversations
             .get_recent(&conv_id, max_history)
+            .await
             .unwrap_or_default();
         let mut messages = vec![Message {
             role: "system".into(),
@@ -183,6 +201,17 @@ pub async fn run(
                         None,
                         None,
                     );
+                    conversations
+                        .append_or_log(&conv_id, "assistant", &response, Some(&tool_result.tool))
+                        .await;
+                    conversations
+                        .append_or_log(
+                            &conv_id,
+                            "system",
+                            &format!("Tool: {}", tool_result.output),
+                            None,
+                        )
+                        .await;
 
                     let preserve_raw = matches!(
                         tool_result.tool.as_str(),
@@ -202,9 +231,15 @@ pub async fn run(
                             None,
                             None,
                         );
+                        conversations
+                            .append_or_log(&conv_id, "assistant", &tool_result.output, None)
+                            .await;
                     } else {
                         // Get follow-up summary.
-                        let recent = conversations.get_recent(&conv_id, 6).unwrap_or_default();
+                        let recent = conversations
+                            .get_recent(&conv_id, 6)
+                            .await
+                            .unwrap_or_default();
                         let mut summary_msgs = vec![Message {
                             role: "system".into(),
                             content: "Summarize the tool result in one sentence.".into(),
@@ -234,12 +269,18 @@ pub async fn run(
                                     None,
                                     None,
                                 );
+                                conversations
+                                    .append_or_log(&conv_id, "assistant", &summary, None)
+                                    .await;
                             }
                             Err(_) => eprintln!(),
                         }
                     }
                 } else {
                     conversations.append_or_log(&conv_id, "assistant", &response, None, None);
+                    conversations
+                        .append_or_log(&conv_id, "assistant", &response, None)
+                        .await;
                 }
             }
             Err(e) => {

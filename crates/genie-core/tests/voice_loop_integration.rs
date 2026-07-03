@@ -190,13 +190,18 @@ async fn full_mock_voice_turn_persists_user_and_assistant_to_conversation_store(
     let conv_dir = unique_dir("conv");
     let store = ConversationStore::open(&conv_dir.join("conversations.db")).unwrap();
     let conv_id = "voice-it";
-    store.ensure(conv_id, "voice cycle integration").unwrap();
+    store
+        .ensure(conv_id, "voice cycle integration")
+        .await
+        .unwrap();
 
     // STT half — exactly what voice_cycle does after arecord returns.
     let transcript = stt.transcribe_file("ignored.wav").await.unwrap();
     assert_eq!(transcript.text, "turn the kitchen light on");
     store
         .append(conv_id, "user", transcript.text.trim(), None, None)
+        .append(conv_id, "user", transcript.text.trim(), None)
+        .await
         .unwrap();
 
     // LLM half — exactly what voice_cycle does after the system prompt is
@@ -210,11 +215,13 @@ async fn full_mock_voice_turn_persists_user_and_assistant_to_conversation_store(
     assert_eq!(reply, "Done — kitchen light is on.");
     store
         .append(conv_id, "assistant", &reply, None, None)
+        .append(conv_id, "assistant", &reply, None)
+        .await
         .unwrap();
 
     // Assert: the conversation store ends in (user, assistant) order, the
     // same shape voice_cycle would have produced.
-    let recent = store.get_recent(conv_id, 4).unwrap();
+    let recent = store.get_recent(conv_id, 4).await.unwrap();
     assert_eq!(recent.len(), 2, "expected exactly user + assistant");
     assert_eq!(recent[0].role, "user");
     assert_eq!(recent[0].content, "turn the kitchen light on");
@@ -233,7 +240,7 @@ async fn mock_voice_cycle_drives_stt_then_llm_then_streaming_tts_then_tool_audit
     let dir = unique_dir("full-cycle");
     let store = ConversationStore::open(&dir.join("conversations.db")).unwrap();
     let conv_id = "voice-it-full";
-    store.ensure(conv_id, "full voice cycle").unwrap();
+    store.ensure(conv_id, "full voice cycle").await.unwrap();
     let audit_path = dir.join("tool-audit.jsonl");
     let dispatcher = ToolDispatcher::new(None).with_tool_audit_path(audit_path.clone());
 
@@ -250,6 +257,8 @@ async fn mock_voice_cycle_drives_stt_then_llm_then_streaming_tts_then_tool_audit
 
     store
         .append(conv_id, "user", transcript.text.trim(), None, None)
+        .append(conv_id, "user", transcript.text.trim(), None)
+        .await
         .unwrap();
 
     let messages = vec![Message {
@@ -277,6 +286,8 @@ async fn mock_voice_cycle_drives_stt_then_llm_then_streaming_tts_then_tool_audit
             Some(&tool_result.tool),
             None,
         )
+        .append(conv_id, "assistant", &llm_output, Some(&tool_result.tool))
+        .await
         .unwrap();
     store
         .append(
@@ -286,10 +297,11 @@ async fn mock_voice_cycle_drives_stt_then_llm_then_streaming_tts_then_tool_audit
             None,
             None,
         )
+        .await
         .unwrap();
 
     // (b) Conversation store assertion.
-    let history = store.get_recent(conv_id, 10).unwrap();
+    let history = store.get_recent(conv_id, 10).await.unwrap();
     assert_eq!(history.len(), 3);
     assert_eq!(history[0].role, "user");
     assert_eq!(history[0].content, "what time is it");
@@ -320,12 +332,13 @@ async fn mock_voice_turn_handles_back_to_back_cycles_without_state_bleed() {
     let conv_dir = unique_dir("conv-2cycle");
     let store = ConversationStore::open(&conv_dir.join("conversations.db")).unwrap();
     let conv_id = "voice-it-2";
-    store.ensure(conv_id, "two cycles").unwrap();
+    store.ensure(conv_id, "two cycles").await.unwrap();
 
     for expected_user in ["first prompt", "second prompt"] {
         let t = stt.transcribe_file("ignored.wav").await.unwrap();
         assert_eq!(t.text, expected_user);
         store.append(conv_id, "user", &t.text, None, None).unwrap();
+        store.append(conv_id, "user", &t.text, None).await.unwrap();
         let reply = llm
             .chat(
                 &[Message {
@@ -338,10 +351,12 @@ async fn mock_voice_turn_handles_back_to_back_cycles_without_state_bleed() {
             .unwrap();
         store
             .append(conv_id, "assistant", &reply, None, None)
+            .append(conv_id, "assistant", &reply, None)
+            .await
             .unwrap();
     }
 
-    let all = store.get_recent(conv_id, 10).unwrap();
+    let all = store.get_recent(conv_id, 10).await.unwrap();
     assert_eq!(all.len(), 4);
     assert_eq!(all[0].content, "first prompt");
     assert_eq!(all[1].content, "first reply");
@@ -392,6 +407,7 @@ async fn process_transcript_drives_full_voice_cycle_with_mocks() {
     let conv_id = "voice-it-process";
     conversations
         .ensure(conv_id, "process_transcript integration")
+        .await
         .unwrap();
 
     let audit_path = dir.join("tool-audit.jsonl");
@@ -439,7 +455,7 @@ async fn process_transcript_drives_full_voice_cycle_with_mocks() {
 
     // (a) Transcript flow — the user message ended up in the conversation
     //     store, sourced from the transcript text.
-    let history = conversations.get_recent(conv_id, 10).unwrap();
+    let history = conversations.get_recent(conv_id, 10).await.unwrap();
     assert!(
         history
             .iter()
@@ -483,7 +499,10 @@ async fn process_transcript_ignores_empty_transcript() {
     let memory: SharedMemory = Arc::new(Mutex::new(Memory::open(&dir.join("memory.db")).unwrap()));
     let conversations = ConversationStore::open(&dir.join("conversations.db")).unwrap();
     let conv_id = "voice-it-empty";
-    conversations.ensure(conv_id, "empty transcript").unwrap();
+    conversations
+        .ensure(conv_id, "empty transcript")
+        .await
+        .unwrap();
 
     // LLM with zero replies — if process_transcript reaches it, the call
     // errors and the test fails to maintain its invariants.
@@ -519,7 +538,7 @@ async fn process_transcript_ignores_empty_transcript() {
     .await;
 
     assert!(kept_running);
-    let history = conversations.get_recent(conv_id, 10).unwrap();
+    let history = conversations.get_recent(conv_id, 10).await.unwrap();
     assert!(
         history.is_empty(),
         "no messages should be appended for empty transcript"
