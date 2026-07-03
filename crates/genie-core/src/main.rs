@@ -199,23 +199,12 @@ async fn main() -> Result<()> {
         &tool_dispatcher,
         mem_count,
         mem_promoted_count,
-        &conversations,
+        conv_count,
         &system_prompt,
         config.core.max_history_turns,
         model_family,
         &connectivity_health,
     );
-    let boot_contract = memory::with_shared_memory(&memory, |mem| {
-        genie_core::server::build_runtime_contract_snapshot(
-            &tool_dispatcher,
-            mem,
-            conv_count,
-            &system_prompt,
-            config.core.max_history_turns,
-            model_family,
-            &connectivity_health,
-        )
-    });
     let contract_hash = boot_contract.contract_hash.clone();
     let contract_validation = genie_core::runtime_contract::validate_runtime_contract(
         &contract_hash,

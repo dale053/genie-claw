@@ -14,13 +14,11 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
 use crate::conversation::ConversationStore;
-use crate::llm::{LlmBackendClient, LlmClient, LlmRequestHints, Message, PrivacyProxyBackend};
-use crate::memory::{SharedMemory, with_shared_memory};
 use crate::llm::{
     LlmBackendClient, LlmClient, LlmRequestHints, LocalProvider, Message, PrivacyProxyBackend,
     Provider,
 };
-use crate::memory::{Memory, SharedMemory, with_shared_memory};
+use crate::memory::{SharedMemory, with_shared_memory};
 use crate::origin_auth::OriginResolver;
 use crate::prompt::ModelFamily;
 use crate::reasoning::InteractionKind;
@@ -1232,17 +1230,13 @@ pub async fn process_chat_turn(
                 },
             )
             .await;
-        let final_response = finalize_direct_tool_turn(conversations, conv_id, &call, &tool_result);
+        let final_response =
+            finalize_direct_tool_turn(conversations, conv_id, &call, &tool_result).await;
         let user_text_owned = user_text.to_string();
         with_shared_memory(memory, move |memory| {
             crate::memory::extract::extract_and_store(memory, &user_text_owned);
         })
         .await;
-        let final_response =
-            finalize_direct_tool_turn(conversations, conv_id, &call, &tool_result).await;
-        with_shared_memory(memory, |memory| {
-            crate::memory::extract::extract_and_store(memory, user_text);
-        });
         return Ok(ChatTurnResult {
             response: final_response,
             tool: Some(tool_result.tool),
@@ -1761,42 +1755,20 @@ async fn handle_health(
             )
         })
         .await;
-    let conv_count = conversations.list().map(|l| l.len()).unwrap_or(0);
-    let conversation_db_bytes = conversations.db_size_bytes().unwrap_or(0);
+    let conv_count = conversations.list().await.map(|l| l.len()).unwrap_or(0);
+    let conversation_db_bytes = conversations.db_size_bytes().await.unwrap_or(0);
     let mem_avail = genie_common::tegrastats::mem_available_mb().unwrap_or(0);
     let chat = chat_gate.snapshot();
     let runtime_contract = build_runtime_contract_snapshot(
         tools,
         mem_count,
         mem_promoted_count,
-        conversations,
+        conv_count,
         system_prompt,
         max_history,
         model_family,
         &connectivity_health,
     );
-    let (mem_count, memory_health, memory_db_bytes) = with_shared_memory(memory, |memory| {
-        (
-            memory.count().unwrap_or(0),
-            memory.health().ok(),
-            memory.db_size_bytes().unwrap_or(0),
-        )
-    });
-    let conv_count = conversations.list().await.map(|l| l.len()).unwrap_or(0);
-    let conversation_db_bytes = conversations.db_size_bytes().await.unwrap_or(0);
-    let mem_avail = genie_common::tegrastats::mem_available_mb().unwrap_or(0);
-    let chat = chat_gate.snapshot();
-    let runtime_contract = with_shared_memory(memory, |memory| {
-        build_runtime_contract_snapshot(
-            tools,
-            memory,
-            conv_count,
-            system_prompt,
-            max_history,
-            model_family,
-            &connectivity_health,
-        )
-    });
     let runtime_contract =
         runtime_contract_summary_json(&runtime_contract, expected_runtime_contract_hash);
 
@@ -1927,24 +1899,15 @@ async fn handle_runtime_contract(
         (
             memory.count().unwrap_or(0),
             memory.promoted_count().unwrap_or(0),
-    let conv_count = conversations.list().await.map(|l| l.len()).unwrap_or(0);
-    let contract = with_shared_memory(memory, |memory| {
-        build_runtime_contract_snapshot(
-            tools,
-            memory,
-            conv_count,
-            system_prompt,
-            max_history,
-            model_family,
-            &connectivity_health,
         )
     })
     .await;
+    let conv_count = conversations.list().await.map(|l| l.len()).unwrap_or(0);
     let contract = build_runtime_contract_snapshot(
         tools,
         mem_count,
         mem_promoted_count,
-        conversations,
+        conv_count,
         system_prompt,
         max_history,
         model_family,
@@ -1962,8 +1925,6 @@ pub fn build_runtime_contract_snapshot(
     tools: &ToolDispatcher,
     mem_count: usize,
     mem_promoted_count: usize,
-    conversations: &ConversationStore,
-    memory: &Memory,
     conv_count: usize,
     system_prompt: &str,
     max_history: usize,
