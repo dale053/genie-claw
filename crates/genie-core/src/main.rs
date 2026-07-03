@@ -118,12 +118,6 @@ async fn main() -> Result<()> {
     // lock held, so it can't stall any other memory access while running.
     let profile_dir = config.data_dir.join("profile");
     match genie_core::profile::load_profile(&profile_dir, &memory).await {
-    let profile_dir_owned = profile_dir.clone();
-    match memory::with_shared_memory(&memory, move |mem| {
-        genie_core::profile::load_profile(&profile_dir_owned, mem)
-    })
-    .await
-    {
         Ok(report) if report.total() > 0 => {
             tracing::info!(
                 toml = report.toml_facts,

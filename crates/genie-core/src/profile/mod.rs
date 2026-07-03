@@ -43,9 +43,11 @@ pub async fn load_profile(profile_dir: &Path, memory: &SharedMemory) -> Result<P
     // no subprocess involved, so a brief lock is fine.
     let toml_path = profile_dir.join("profile.toml");
     if toml_path.exists() {
-        let result = with_shared_memory(memory, |mem| {
-            toml_profile::load_toml_profile(&toml_path, mem)
-        });
+        let toml_path_owned = toml_path.clone();
+        let result = with_shared_memory(memory, move |mem| {
+            toml_profile::load_toml_profile(&toml_path_owned, mem)
+        })
+        .await;
         match result {
             Ok(count) => {
                 tracing::info!(facts = count, "profile.toml loaded");
@@ -82,7 +84,8 @@ pub async fn load_profile(profile_dir: &Path, memory: &SharedMemory) -> Result<P
                 let path_for_ingest = path.clone();
                 let count = with_shared_memory(memory, move |mem| {
                     ingest::ingest_text_file(&path_for_ingest, mem)
-                });
+                })
+                .await;
                 if count > 0 {
                     tracing::info!(
                         file = %path.display(),
@@ -106,7 +109,8 @@ pub async fn load_profile(profile_dir: &Path, memory: &SharedMemory) -> Result<P
                     .to_string();
                 let count = with_shared_memory(memory, move |mem: &Memory| {
                     ingest::ingest_pdf_text(&text, &filename, mem)
-                });
+                })
+                .await;
                 if count > 0 {
                     tracing::info!(
                         file = %path.display(),
