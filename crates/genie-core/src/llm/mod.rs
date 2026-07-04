@@ -1,5 +1,6 @@
 mod genie_ai_runtime;
 mod llama_cpp;
+mod local_provider;
 mod mock;
 mod openai_compat;
 mod openai_compatible;
@@ -8,10 +9,13 @@ mod provider;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use genie_common::config::{LlmBackendKind, ServiceEndpoint};
+use genie_common::config::{
+    ActiveLlmProviderKind, Config, LlmBackendKind, OptionalAiProviderKind, ServiceEndpoint,
+};
 
 pub use genie_ai_runtime::GenieAiRuntimeBackend;
 pub use llama_cpp::LlamaCppBackend;
+pub use local_provider::{LocalProvider, Provider};
 pub use mock::MockLlmBackend;
 pub use openai_compat::{LlmTimeouts, Message, ResponseFormat};
 pub use openai_compatible::OpenAiCompatibleBackend;
@@ -136,6 +140,44 @@ impl LlmClient {
             }
             LlmBackendKind::GenieAiRuntime => {
                 Self::from_genie_ai_runtime_url_with_timeouts(&service.url, timeouts)
+            }
+        }
+    }
+
+    /// Build the active LLM client from `geniepod.toml` (#568).
+    ///
+    /// When `[optional_ai_provider].enabled = true`, routes through the gated
+    /// OpenAI-compatible API surface; otherwise uses `[services.llm]`.
+    pub fn from_config(config: &Config) -> Result<Self> {
+        let timeouts = LlmTimeouts::from_secs(
+            config.core.llm_connect_timeout_secs,
+            config.core.llm_read_timeout_secs,
+            config.core.llm_request_timeout_secs,
+        );
+
+        match config.active_llm_provider_kind() {
+            ActiveLlmProviderKind::Local => Ok(Self::from_service_config_with_timeouts(
+                &config.services.llm,
+                timeouts,
+            )),
+            ActiveLlmProviderKind::OptionalApi => {
+                let provider = &config.optional_ai_provider;
+                match provider.provider {
+                    OptionalAiProviderKind::OpenAiCompatible | OptionalAiProviderKind::OpenAi => {
+                        Ok(
+                            Self::from_openai_compatible_url_with_bearer_token_env_and_timeouts(
+                                provider.base_url.trim(),
+                                provider.credential_env(),
+                                timeouts,
+                            ),
+                        )
+                    }
+                    OptionalAiProviderKind::Anthropic
+                    | OptionalAiProviderKind::Gemini
+                    | OptionalAiProviderKind::Custom => unreachable!(
+                        "unsupported optional_ai_provider kinds are rejected at config load"
+                    ),
+                }
             }
         }
     }
