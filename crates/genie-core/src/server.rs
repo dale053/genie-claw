@@ -1704,7 +1704,9 @@ async fn handle_health(
     });
     let conv_count = conversations.list().map(|l| l.len()).unwrap_or(0);
     let conversation_db_bytes = conversations.db_size_bytes().unwrap_or(0);
-    let mem_avail = genie_common::tegrastats::mem_available_mb().unwrap_or(0);
+    let mem_avail = genie_common::tegrastats::mem_available_mb_async()
+        .await
+        .unwrap_or(0);
     let chat = chat_gate.snapshot();
     let runtime_contract = with_shared_memory(memory, |memory| {
         build_runtime_contract_snapshot(
