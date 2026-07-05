@@ -58,10 +58,42 @@ fn integer_math_is_unchanged() {
 }
 
 #[test]
+fn spoken_cardinals_in_percentage_and_temperature() {
+    assert_eq!(expression("what is twenty percent of 80"), "80 * 20 / 100");
+    assert_eq!(expression("what is 20 percent of eighty"), "80 * 20 / 100");
+    assert_eq!(
+        expression("what is twenty five percent of eighty"),
+        "80 * 25 / 100"
+    );
+    assert_eq!(
+        expression("convert ninety eight f to celsius"),
+        "(98 - 32) * 5 / 9"
+    );
+    assert_eq!(
+        expression("convert 350 degrees to celsius"),
+        "(350 - 32) * 5 / 9"
+    );
+}
+
+#[test]
 fn non_math_does_not_route_to_calculate() {
     assert!(
         route("what time is it")
             .map(|c| c.name != "calculate")
             .unwrap_or(true)
     );
+}
+
+#[test]
+fn percent_symbol_routes_like_the_spelled_out_word() {
+    // The "%" symbol is the common way to type a percentage. It must reach the
+    // same calculator expression as the spelled-out "percent" word, which
+    // already works (`spoken_cardinals_in_percentage_and_temperature`).
+    assert_eq!(expression("what is 15% of 200"), "200 * 15 / 100");
+    assert_eq!(expression("what is 20% of 80"), "80 * 20 / 100");
+    // A spaced "%" and a decimal base both fold to the same expression.
+    assert_eq!(expression("what is 20 % of 80"), "80 * 20 / 100");
+    assert_eq!(expression("what is 12.5% of 80"), "80 * 12.5 / 100");
+    // Apostrophe prefix ("what's") must not block the percent-symbol path.
+    assert_eq!(expression("what's 50% of 80"), "80 * 50 / 100");
 }
