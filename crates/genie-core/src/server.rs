@@ -6,7 +6,10 @@ use anyhow::Result;
 use genie_common::config::{
     EscalationTrigger, HttpServerConfig, PrivacyProxyConfig, StorageConfig,
 };
-use genie_common::http::{GuardRejection, HttpLimits, OriginDecision, RequestGuard, read_request};
+use genie_common::http::{
+    GuardRejection, HttpLimits, OriginDecision, RequestGuard, RoutePolicySurface, read_request,
+    route_requires_local_token,
+};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
@@ -374,26 +377,6 @@ enum RequestRoute<'a> {
     NotFound,
 }
 
-impl RequestRoute<'_> {
-    /// True for state-changing / actuating endpoints, which require the shared
-    /// local API token when one is configured (issue #228). Read-only routes
-    /// are guarded by the Origin/Host gate alone.
-    fn is_mutating(&self) -> bool {
-        matches!(
-            self,
-            RequestRoute::ChatStream
-                | RequestRoute::Chat
-                | RequestRoute::Clear
-                | RequestRoute::WebSearchPost
-                | RequestRoute::ActuationConfirm
-                | RequestRoute::MemoriesUpdate
-                | RequestRoute::MemoriesDelete
-                | RequestRoute::MemoriesReorder
-                | RequestRoute::OpenAiChat
-        )
-    }
-}
-
 fn classify_route<'a>(method: &str, path: &'a str) -> RequestRoute<'a> {
     match (method, path) {
         ("GET", "/" | "/index.html") => RequestRoute::Root,
@@ -691,7 +674,12 @@ async fn handle_request(
         }
     };
     let route = classify_route(&request.method, &request.path);
-    if route.is_mutating() && !guard.token_ok(&request) {
+    if route_requires_local_token(
+        RoutePolicySurface::GenieCore,
+        &request.method,
+        &request.path,
+    ) && !guard.token_ok(&request)
+    {
         tracing::debug!("mutating request without a valid local API token");
         let _ = write_guard_rejection(
             &mut writer,
@@ -3965,6 +3953,21 @@ mod tests {
                 )
                 .await;
                 assert!(with_tok.starts_with("HTTP/1.1 200"), "{with_tok:?}");
+
+                // Sensitive actuation reads are token-gated as well.
+                let pending_no_tok = http_roundtrip(
+                    port,
+                    "GET /api/actuation/pending HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .await;
+                assert!(pending_no_tok.starts_with("HTTP/1.1 403"), "{pending_no_tok:?}");
+
+                let actions_no_tok = http_roundtrip(
+                    port,
+                    "GET /api/actuation/actions HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .await;
+                assert!(actions_no_tok.starts_with("HTTP/1.1 403"), "{actions_no_tok:?}");
 
                 // A read route stays open without a token.
                 let read = http_roundtrip(
