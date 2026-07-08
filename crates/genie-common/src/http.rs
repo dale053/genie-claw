@@ -44,11 +44,7 @@ pub enum RoutePolicySurface {
 /// Returns true when `method`+`path` must present a valid local API token when
 /// one is configured. This is centralized here so `genie-core` and `genie-api`
 /// cannot silently drift on sensitive route classification.
-pub fn route_requires_local_token(
-    surface: RoutePolicySurface,
-    method: &str,
-    path: &str,
-) -> bool {
+pub fn route_requires_local_token(surface: RoutePolicySurface, method: &str, path: &str) -> bool {
     match (method, path) {
         // Sensitive actuation routes.
         ("POST", "/api/actuation/confirm")

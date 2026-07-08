@@ -427,7 +427,10 @@ mod tests {
         ] {
             let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
             let resp = roundtrip(port, &request).await;
-            assert!(resp.starts_with("HTTP/1.1 403"), "path {path} response: {resp:?}");
+            assert!(
+                resp.starts_with("HTTP/1.1 403"),
+                "path {path} response: {resp:?}"
+            );
         }
 
         // The served dashboard carries the injected token.
