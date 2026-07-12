@@ -216,12 +216,29 @@ fn tool(name: &str, arguments: serde_json::Value) -> ToolCall {
 }
 
 fn normalize(text: &str) -> String {
-    text.trim()
-        .to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && !c.is_whitespace(), " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    // Lowercase (Unicode-correct), map every non-alphanumeric char to a single
+    // space, and collapse runs of them — in one pass into one buffer. Previously
+    // this chained `.replace(...)` + `.split_whitespace().collect::<Vec<_>>()` +
+    // `.join(" ")`, allocating an intermediate String, a `Vec<&str>`, and the
+    // joined String on top of the lowercased one; `normalize` runs on every
+    // routing turn. Output is byte-identical: non-alphanumeric == the old
+    // "whitespace or punctuation" set, so each maximal run collapses to one
+    // space with leading/trailing spaces trimmed.
+    let lowered = text.to_lowercase();
+    let mut out = String::with_capacity(lowered.len());
+    let mut pending_space = false;
+    for ch in lowered.chars() {
+        if ch.is_alphanumeric() {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push(ch);
+        } else {
+            pending_space = true;
+        }
+    }
+    out
 }
 
 fn strip_household_speaker_prefix(text: &str) -> String {
@@ -1923,6 +1940,16 @@ fn parse_temperature_target(rest: &str) -> Option<(String, f64)> {
         .trim_start_matches("the ")
         .trim_start_matches("a ")
         .trim_start_matches("an ");
+    // A trailing directional adverb describes the setpoint change, not the
+    // device: "set the thermostat down to 68" / "set the thermostat up to 72"
+    // name the thermostat, not "thermostat down". Strip it so the entity stays
+    // the named device.
+    let entity = entity
+        .strip_suffix(" down")
+        .or_else(|| entity.strip_suffix(" up"))
+        .or_else(|| entity.strip_suffix(" back"))
+        .map(str::trim)
+        .unwrap_or(entity);
     if entity.is_empty() {
         return None;
     }
@@ -2464,8 +2491,16 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     // Try a fractional duration ("half an hour", "quarter of an hour") before the
     // whole-number parser: `parse_duration` skips the fraction word and reads the
     // bare unit, so "half an hour" used to become "an hour" -> 3600s.
+    let (seconds, unit_end_index) = fractional_duration(&tokens)
+        .or_else(|| couple_duration(&tokens))
+        .or_else(|| parse_duration(&tokens))?;
+    // `fractional_duration` and `couple_duration` return as soon as they match
+    // their idiom, unlike `parse_duration`'s own trailing-span sum, so "half an
+    // hour and 15 minutes" silently dropped the second span, emitting a
+    // confidently-wrong 1800s instead of 2700s. Extending every path here makes
+    // compound summing uniform regardless of which detector matched first.
     let (seconds, unit_end_index) =
-        fractional_duration(&tokens).or_else(|| parse_duration(&tokens))?;
+        extend_duration_with_trailing_spans(&tokens, seconds, unit_end_index);
     if seconds == 0 {
         return None;
     }
@@ -2584,15 +2619,51 @@ fn is_time_unit(token: &str) -> bool {
     )
 }
 
+/// True when the text after `rain in …` is a time expression ("the morning",
+/// "an hour", "20 minutes", "a bit") rather than a place, so it must not be
+/// treated as a weather location. Leading "the " is already trimmed by
+/// [`extract_location_after_marker`].
+fn is_time_expression(location: &str) -> bool {
+    // Vague time-of-day / duration words that are single tokens (so they are not
+    // caught by the "<n> <unit>" tail check below).
+    const TIME_PHRASES: &[&str] = &[
+        "morning",
+        "afternoon",
+        "evening",
+        "night",
+        "midday",
+        "noon",
+        "midnight",
+        "a while",
+        "a bit",
+        "a moment",
+    ];
+    if TIME_PHRASES.contains(&location) {
+        return true;
+    }
+    // Numeric / vague durations ending in a time unit: "20 minutes", "an hour",
+    // "a few hours", "a couple days", "the next hour".
+    matches!(
+        location.split_whitespace().next_back(),
+        Some(last) if is_time_unit(last) || matches!(last, "day" | "days" | "week" | "weeks")
+    )
+}
+
 fn weather_request(text: &str) -> Option<(String, bool)> {
     if text.starts_with("is it rain") || text.starts_with("will it rain") {
         if text.contains("school pickup") {
             return Some(("home".into(), false));
         }
-        if let Some(location) = extract_location_after_marker(text, " for ")
+        // Accept a named place after "in"/"for" ("will it rain in Seattle"), but
+        // not a time expression ("will it rain in the morning" / "in an hour"),
+        // which keeps the default local forecast. The " for " marker alone missed
+        // the common "rain in <city>" order entirely.
+        if let Some(location) = extract_location_after_marker(text, " in ")
+            .or_else(|| extract_location_after_marker(text, " for "))
             && !location.is_empty()
             && location != "today"
             && location != "tomorrow"
+            && !is_time_expression(&location)
         {
             if location.contains("school pickup") {
                 return Some(("home".into(), false));
@@ -2636,6 +2707,10 @@ fn web_search_request(text: &str) -> Option<(String, bool)> {
             })
             .unwrap_or("")
             .trim();
+        // Drop a trailing time qualifier ("apple today" -> "apple") so it does
+        // not leak into the subject and defeat the company_ticker lookup (which
+        // matches the bare company name).
+        let subject = strip_trailing_time_qualifier(subject);
         let query = if subject.is_empty() {
             "stock price".to_string()
         } else {
@@ -2703,15 +2778,12 @@ fn company_ticker(subject: &str) -> Option<&'static str> {
     }
 }
 
-fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
-    let (_, location) = text.rsplit_once(marker)?;
-    let location = location
-        .trim()
-        .trim_start_matches("the ")
-        // Drop a trailing time qualifier so "weather in Denver tonight" yields
-        // "denver", not "denver tonight". Longest phrases first so a shorter
-        // suffix (" now") does not pre-empt a longer one (" right now"). Forecast
-        // detection reads the whole utterance, so trimming here never changes it.
+/// Strip a trailing time qualifier ("denver tonight" -> "denver", "apple this
+/// morning" -> "apple") so it does not leak into an extracted location or stock
+/// subject and defeat downstream matching. Longest phrases first so a shorter
+/// suffix (" now") does not pre-empt a longer one (" right now").
+fn strip_trailing_time_qualifier(subject: &str) -> &str {
+    subject
         .trim_end_matches(" right now")
         .trim_end_matches(" this weekend")
         .trim_end_matches(" this week")
@@ -2725,7 +2797,14 @@ fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
         .trim_end_matches(" later")
         .trim_end_matches(" currently")
         .trim()
-        .to_string();
+}
+
+fn extract_location_after_marker(text: &str, marker: &str) -> Option<String> {
+    let (_, location) = text.rsplit_once(marker)?;
+    // Forecast detection reads the whole utterance, so trimming a trailing time
+    // qualifier here never changes it.
+    let location =
+        strip_trailing_time_qualifier(location.trim().trim_start_matches("the ")).to_string();
     if location.is_empty() {
         None
     } else {
@@ -2847,6 +2926,18 @@ fn calc_number_starting_at(tokens: &[&str], start: usize) -> Option<f64> {
     if start >= tokens.len() {
         return None;
     }
+    // A leading article ("a"/"an") is not the amount: "20 percent of a 50 dollar
+    // bill" means 50, not 1 (the article word parses as the cardinal 1). Skip it
+    // and read the number that follows — but only when a real number actually
+    // follows, so "a dollar" (no number after) still falls through to 1.
+    if matches!(tokens[start], "a" | "an") && start + 1 < tokens.len() {
+        if let Some((value, _)) = super::number_words::parse_spoken_number(tokens, start + 1) {
+            return Some(value as f64);
+        }
+        if let Some(value) = parse_decimal_token(tokens[start + 1]) {
+            return Some(value);
+        }
+    }
     if let Some((value, _)) = super::number_words::parse_spoken_number(tokens, start) {
         return Some(value as f64);
     }
@@ -2917,6 +3008,25 @@ fn fractional_duration(tokens: &[&str]) -> Option<(u64, usize)> {
     None
 }
 
+/// Parse the spoken idiom "a couple of minutes" (always two of the unit).
+/// `parse_duration` does not treat "couple" as a number, so these utterances
+/// used to abstain or mis-route. Returns the duration and the unit token index
+/// for label extraction, matching `fractional_duration`.
+fn couple_duration(tokens: &[&str]) -> Option<(u64, usize)> {
+    for i in 0..tokens.len() {
+        if tokens[i] != "couple" {
+            continue;
+        }
+        let mut unit_index = i + 1;
+        if tokens.get(unit_index).copied() == Some("of") {
+            unit_index += 1;
+        }
+        let multiplier = duration_unit_seconds(tokens.get(unit_index).copied())?;
+        return Some((2_u64.saturating_mul(multiplier), unit_index));
+    }
+    None
+}
+
 fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
     let mut start = 0;
     while start < tokens.len() {
@@ -2960,6 +3070,58 @@ fn parse_duration(tokens: &[&str]) -> Option<(u64, usize)> {
         return Some((total, last_unit_index));
     }
     None
+}
+
+/// Sum any further `<number> <unit>` spans immediately following an
+/// already-matched duration (optionally joined by a single "and"), the same
+/// accumulation `parse_duration` applies to its own first span. Applying this
+/// after `fractional_duration` / `couple_duration` as well makes compound
+/// summing uniform across all three duration detectors — see the caller in
+/// `timer_request`.
+fn extend_duration_with_trailing_spans(
+    tokens: &[&str],
+    mut total: u64,
+    mut last_unit_index: usize,
+) -> (u64, usize) {
+    loop {
+        let mut next = last_unit_index + 1;
+        if tokens.get(next).copied() == Some("and") {
+            next += 1;
+        }
+        let Some((amount, unit_index)) = super::number_words::parse_spoken_number(tokens, next)
+        else {
+            break;
+        };
+        let Some(multiplier) = duration_unit_seconds(tokens.get(unit_index).copied()) else {
+            break;
+        };
+        total = total.saturating_add(amount.saturating_mul(multiplier));
+        last_unit_index = unit_index;
+    }
+    // A trailing "and a half" / "and a quarter" is a fraction of the last matched
+    // unit ("an hour and a half" = 3600 + 1800). The span loop above stops at the
+    // fraction word because it is not a spoken number followed by a unit, so add
+    // it here. Advancing last_unit_index past the fraction keeps it out of the
+    // reminder-label window.
+    let mut tail = last_unit_index + 1;
+    if tokens.get(tail).copied() == Some("and") {
+        tail += 1;
+    }
+    if matches!(tokens.get(tail).copied(), Some("a" | "an")) {
+        tail += 1;
+    }
+    let fraction_divisor = tokens.get(tail).copied().and_then(|token| match token {
+        "half" => Some(2u64),
+        "quarter" => Some(4u64),
+        _ => None,
+    });
+    if let Some(divisor) = fraction_divisor
+        && let Some(unit_seconds) = duration_unit_seconds(tokens.get(last_unit_index).copied())
+    {
+        total = total.saturating_add(unit_seconds / divisor);
+        last_unit_index = tail;
+    }
+    (total, last_unit_index)
 }
 
 fn reminder_label(tokens: &[&str], unit_end_index: usize) -> Option<String> {
@@ -3009,7 +3171,13 @@ fn clean_status_target(text: &str) -> String {
         }
     }
 
-    for suffix in [
+    // A status query can trail both a state word and a time qualifier
+    // ("is the garage door open right now"). Strip trailing suffixes repeatedly
+    // so the entity is the bare device ("garage door"), not "garage door open"
+    // or "front door locked" — a single pass left the second suffix attached.
+    // Longest phrases sit before their shorter prefixes so " now" never
+    // pre-empts " right now" within a pass.
+    const STATUS_SUFFIXES: &[&str] = &[
         " are on",
         " are off",
         " are open",
@@ -3032,11 +3200,12 @@ fn clean_status_target(text: &str) -> String {
         " active",
         " right now",
         " now",
-    ] {
-        if let Some(stripped) = target.strip_suffix(suffix) {
-            target = stripped.to_string();
-            break;
-        }
+    ];
+    while let Some(stripped) = STATUS_SUFFIXES
+        .iter()
+        .find_map(|suffix| target.strip_suffix(suffix))
+    {
+        target = stripped.trim_end().to_string();
     }
 
     target.trim().to_string()
@@ -4517,6 +4686,26 @@ mod tests {
     }
 
     #[test]
+    fn status_entity_drops_both_state_word_and_time_qualifier() {
+        // A status query can trail a state word AND a time qualifier. The entity
+        // must be the bare device, not "garage door open" / "front door locked"
+        // (a single suffix strip left the second word attached).
+        for (utterance, entity) in [
+            ("Is the garage door open right now?", "garage door"),
+            ("Is the front door locked now?", "front door"),
+            ("Are the upstairs lights on right now?", "upstairs lights"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "home_status", "{utterance:?}");
+            assert_eq!(call.arguments["entity"], entity, "{utterance:?}");
+        }
+
+        // Single-suffix queries are unchanged.
+        let call = route("Is the garage door open?").unwrap();
+        assert_eq!(call.arguments["entity"], "garage door");
+    }
+
+    #[test]
     fn routes_personal_write_statements_to_memory_store() {
         // #379: first-person fact/appointment statements the deterministic router
         // used to abstain on, so the local model misrouted them.
@@ -4594,6 +4783,47 @@ mod tests {
         // Unknown company falls through unchanged.
         let call = route("What is the stock price of Wendys?").unwrap();
         assert_eq!(call.arguments["query"], "wendys stock price");
+    }
+
+    #[test]
+    fn stock_price_query_strips_trailing_time_word() {
+        // A trailing time word ("today"/"right now"/"now") must not leak into the
+        // subject — otherwise company_ticker misses and the query becomes
+        // "apple today stock price" instead of "AAPL stock price".
+        for (utterance, query) in [
+            ("What's the stock price of Apple today?", "AAPL stock price"),
+            ("stock price of Tesla right now", "TSLA stock price"),
+            (
+                "what is the stock price of Microsoft now",
+                "MSFT stock price",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["query"], query, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn stock_price_query_strips_part_of_day_time_word() {
+        // The weather-location path strips part-of-day qualifiers, but the
+        // stock path did not, so "apple stock price this morning" produced
+        // "apple this morning stock price" and company_ticker missed.
+        for (utterance, query) in [
+            (
+                "what's the stock price of apple this morning",
+                "AAPL stock price",
+            ),
+            ("stock price of tesla this afternoon", "TSLA stock price"),
+            (
+                "what is the stock price of microsoft this evening",
+                "MSFT stock price",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "web_search", "{utterance:?}");
+            assert_eq!(call.arguments["query"], query, "{utterance:?}");
+        }
     }
 
     #[test]
@@ -4734,6 +4964,57 @@ mod tests {
     }
 
     #[test]
+    fn routes_couple_duration_timer() {
+        let call = route("set a timer for a couple of minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 120);
+
+        let call = route("remind me in a couple of minutes to stretch").unwrap();
+        assert_eq!(call.arguments["seconds"], 120);
+        assert_eq!(call.arguments["label"], "stretch");
+
+        // The connective "of" is optional; a leading article before "couple" is fine.
+        let call = route("set a timer for couple minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 120);
+
+        let call = route("set a timer for a couple of hours").unwrap();
+        assert_eq!(call.arguments["seconds"], 7200);
+
+        // "couple" inside a later label is not mistaken for duration.
+        assert!(route("remind me in 5 minutes to feed the couple cats").is_some());
+        let call = route("remind me in 5 minutes to feed the couple cats").unwrap();
+        assert_eq!(call.arguments["seconds"], 300);
+        assert_eq!(call.arguments["label"], "feed the couple cats");
+    }
+
+    #[test]
+    fn routes_fractional_and_couple_compound_timer() {
+        // Regression: fractional_duration/couple_duration return as soon as they
+        // match their idiom, unlike parse_duration's own trailing-span sum, so a
+        // second span after "half an hour"/"a couple of minutes" was silently
+        // dropped, emitting a confidently-wrong 1800s instead of 2700s.
+        let call = route("set a timer for half an hour and 15 minutes").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 1800 + 15 * 60);
+
+        // The connective "and" is optional here too, matching parse_duration.
+        let call = route("set a timer for quarter of an hour 5 minutes").unwrap();
+        assert_eq!(call.arguments["seconds"], 900 + 5 * 60);
+
+        let call = route("set a timer for a couple of minutes and 30 seconds").unwrap();
+        assert_eq!(call.arguments["seconds"], 120 + 30);
+
+        // The summed span is carried past the label boundary too.
+        let call = route("remind me in half an hour and 15 minutes to check the oven").unwrap();
+        assert_eq!(call.arguments["seconds"], 1800 + 15 * 60);
+        assert_eq!(call.arguments["label"], "check the oven");
+
+        // A single fractional/idiom span with nothing trailing is unchanged.
+        let call = route("set a timer for half an hour").unwrap();
+        assert_eq!(call.arguments["seconds"], 1800);
+    }
+
+    #[test]
     fn routes_compound_worded_timer() {
         // Regression: "forty five" used to parse as the trailing "five" (5 min)
         // because the compound cardinal was never stitched from its two tokens.
@@ -4753,6 +5034,36 @@ mod tests {
         let call = route("remind me in forty five minutes to check the oven").unwrap();
         assert_eq!(call.arguments["seconds"], 2700);
         assert_eq!(call.arguments["label"], "check the oven");
+    }
+
+    #[test]
+    fn routes_whole_plus_half_compound_timer() {
+        // Regression: the trailing-span sum reads only "<number> <unit>" spans, so
+        // a trailing "and a half" / "and a quarter" fraction of the last unit was
+        // dropped — "an hour and a half" emitted set_timer{seconds:3600} instead
+        // of 5400.
+        let call = route("set a timer for an hour and a half").unwrap();
+        assert_eq!(call.name, "set_timer");
+        assert_eq!(call.arguments["seconds"], 5400);
+
+        let call = route("set a timer for 1 hour and a half").unwrap();
+        assert_eq!(call.arguments["seconds"], 5400);
+
+        let call = route("set a timer for two hours and a half").unwrap();
+        assert_eq!(call.arguments["seconds"], 9000);
+
+        // A quarter tail works the same way, and applies after a fractional idiom
+        // ("half an hour and a quarter" = 1800 + 900) since the extension is shared.
+        let call = route("set a timer for an hour and a quarter").unwrap();
+        assert_eq!(call.arguments["seconds"], 4500);
+
+        let call = route("set a timer for half an hour and a quarter").unwrap();
+        assert_eq!(call.arguments["seconds"], 2700);
+
+        // The fraction is carried past the reminder-label boundary.
+        let call = route("remind me in an hour and a half to stretch").unwrap();
+        assert_eq!(call.arguments["seconds"], 5400);
+        assert_eq!(call.arguments["label"], "stretch");
     }
 
     #[test]
@@ -4871,6 +5182,38 @@ mod tests {
             assert_eq!(call.name, "get_weather", "{utterance:?}");
             assert_eq!(call.arguments["location"], location, "{utterance:?}");
             assert_eq!(call.arguments["forecast"], forecast, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn rain_query_keeps_named_city() {
+        // "will it rain in <city>" used to drop the city and return home weather
+        // because the rain branch only checked the " for " marker, never " in ".
+        for (utterance, location) in [
+            ("will it rain in Seattle tomorrow?", "seattle"),
+            ("is it raining in Denver", "denver"),
+            ("will it rain in New York this weekend", "new york"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_weather", "{utterance:?}");
+            assert_eq!(call.arguments["location"], location, "{utterance:?}");
+        }
+    }
+
+    #[test]
+    fn rain_query_time_expression_is_not_a_location() {
+        // A time expression after "in" ("the morning", "an hour", "20 minutes")
+        // is not a place — the query must keep the default local forecast, not
+        // route to get_weather with location "morning".
+        for utterance in [
+            "will it rain in the morning",
+            "will it rain in an hour",
+            "will it rain in 20 minutes",
+            "will it rain in a bit",
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "get_weather", "{utterance:?}");
+            assert_eq!(call.arguments["location"], "home", "{utterance:?}");
         }
     }
 
