@@ -3,15 +3,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use genie_common::config::{
-    EscalationTrigger, HttpServerConfig, PrivacyProxyConfig, StorageConfig,
-};
+use genie_common::config::{HttpServerConfig, PrivacyProxyConfig, StorageConfig};
 use genie_common::http::{
     GuardRejection, HttpLimits, OriginDecision, RequestGuard, RoutePolicySurface, read_request,
     route_requires_local_token,
 };
-use genie_common::config::{HttpServerConfig, PrivacyProxyConfig, StorageConfig};
-use genie_common::http::{GuardRejection, HttpLimits, OriginDecision, RequestGuard, read_request};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::net::tcp::OwnedWriteHalf;
@@ -3997,7 +3993,6 @@ mod tests {
 
                 // Sensitive actuation reads are token-gated as well.
                 let pending_no_tok = http_roundtrip(
-                let actuation_no_tok = http_roundtrip(
                     port,
                     "GET /api/actuation/pending HTTP/1.1\r\nHost: localhost\r\n\r\n",
                 )
@@ -4010,7 +4005,6 @@ mod tests {
                 )
                 .await;
                 assert!(actions_no_tok.starts_with("HTTP/1.1 403"), "{actions_no_tok:?}");
-                assert!(actuation_no_tok.starts_with("HTTP/1.1 403"), "{actuation_no_tok:?}");
 
                 // A read route stays open without a token.
                 let read = http_roundtrip(

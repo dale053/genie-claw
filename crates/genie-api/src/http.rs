@@ -182,22 +182,6 @@ async fn handle_connection(
     write_response(&mut writer, &response, echo_origin.as_deref()).await
 }
 
-/// State-changing or sensitive actuation routes that require the shared local
-/// API token when one is configured (issue #228, #658).
-fn is_mutating(method: &str, path: &str) -> bool {
-    matches!(
-        (method, path),
-        ("POST", "/api/actuation/confirm")
-            | ("GET", "/api/actuation/pending")
-            | ("GET", "/api/actuation/actions")
-            | ("GET", "/api/actuation/audit")
-            | ("POST", "/api/memories/update")
-            | ("POST", "/api/memories/delete")
-            | ("POST", "/api/memories/reorder")
-            | ("POST", "/api/mode")
-    )
-}
-
 /// `403` response for a gated-out request, reusing the shared rejection reason.
 fn guard_rejection(rejection: GuardRejection) -> Response {
     Response {
