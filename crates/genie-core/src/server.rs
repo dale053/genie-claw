@@ -375,9 +375,9 @@ enum RequestRoute<'a> {
 }
 
 impl RequestRoute<'_> {
-    /// True for state-changing / actuating endpoints, which require the shared
-    /// local API token when one is configured (issue #228). Read-only routes
-    /// are guarded by the Origin/Host gate alone.
+    /// True for state-changing or sensitive actuation endpoints, which require
+    /// the shared local API token when one is configured (issue #228, #658).
+    /// Other read-only routes are guarded by the Origin/Host gate alone.
     fn is_mutating(&self) -> bool {
         matches!(
             self,
@@ -385,6 +385,8 @@ impl RequestRoute<'_> {
                 | RequestRoute::Chat
                 | RequestRoute::Clear
                 | RequestRoute::WebSearchPost
+                | RequestRoute::ActuationPending
+                | RequestRoute::ActuationActions
                 | RequestRoute::ActuationConfirm
                 | RequestRoute::MemoriesUpdate
                 | RequestRoute::MemoriesDelete
@@ -3954,6 +3956,14 @@ mod tests {
                 )
                 .await;
                 assert!(with_tok.starts_with("HTTP/1.1 200"), "{with_tok:?}");
+
+                // Sensitive actuation reads are token-gated as well.
+                let actuation_no_tok = http_roundtrip(
+                    port,
+                    "GET /api/actuation/pending HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .await;
+                assert!(actuation_no_tok.starts_with("HTTP/1.1 403"), "{actuation_no_tok:?}");
 
                 // A read route stays open without a token.
                 let read = http_roundtrip(
