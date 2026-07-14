@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// OTA update system for GeniePod.
 ///
@@ -279,26 +280,37 @@ fn compare_semver(a: &SemVer, b: &SemVer) -> std::cmp::Ordering {
 /// Compare semver strings. Returns true if `latest` is strictly newer than
 /// `current`, with full SemVer §11 pre-release precedence — so
 /// `1.0.0-alpha.12` is newer than `1.0.0-alpha.11`, and `1.0.0` is newer than
-/// any `1.0.0-alpha.N`.
-fn version_is_newer(latest: &str, current: &str) -> bool {
+/// any `1.0.0-alpha.N`. Numeric core components compare numerically, so
+/// `1.10.0 > 1.9.0` (a plain string compare gets that backwards). Shared with
+/// the `genie-ctl update-check` command so both update paths agree.
+pub fn version_is_newer(latest: &str, current: &str) -> bool {
     compare_semver(&parse_semver(latest), &parse_semver(current)) == std::cmp::Ordering::Greater
 }
 
 /// GET request to GitHub API (api.github.com).
 /// Uses curl for TLS — available on all Jetson images.
+const GITHUB_API_TIMEOUT: Duration = Duration::from_secs(15);
+
 async fn github_api_get(path: &str) -> Result<String> {
     let url = format!("https://api.github.com{}", path);
-    let output = tokio::process::Command::new("curl")
-        .args([
-            "-sS",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "User-Agent: GeniePod-OTA",
-            &url,
-        ])
-        .output()
-        .await?;
+    let mut cmd = tokio::process::Command::new("curl");
+    cmd.args([
+        "-sS",
+        "--max-time",
+        "15",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "User-Agent: GeniePod-OTA",
+        &url,
+    ])
+    .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(GITHUB_API_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => anyhow::bail!("GitHub API curl failed: {e}"),
+        Err(_) => anyhow::bail!("GitHub API request timed out after {GITHUB_API_TIMEOUT:?}"),
+    };
 
     if !output.status.success() {
         anyhow::bail!(
@@ -349,6 +361,17 @@ mod tests {
         assert!(version_is_newer("1.0.1", "1.0.0"));
         assert!(!version_is_newer("1.0.0", "1.0.0"));
         assert!(!version_is_newer("0.9.0", "1.0.0"));
+    }
+
+    #[test]
+    fn version_comparison_double_digit_components() {
+        // Numeric core components compare numerically, not lexically. This is
+        // the boundary the genie-ctl update-check relied on once a component
+        // reaches two digits (a plain string `>` says "1.10.0" < "1.9.0").
+        assert!(version_is_newer("1.10.0", "1.9.0"));
+        assert!(version_is_newer("1.0.10", "1.0.9"));
+        assert!(version_is_newer("v0.10.0", "v0.9.0"));
+        assert!(!version_is_newer("1.9.0", "1.10.0"));
     }
 
     #[test]

@@ -15,8 +15,9 @@
 //!                              Generate deterministic quick-router predictions
 //!   genie-ctl bfcl-predict-llm --cases CASES.jsonl --out PREDS.jsonl
 //!                              Generate local LLM tool-call predictions
-//!   genie-ctl bfcl-score-llm --cases CASES.jsonl [--out PREDS.jsonl]
+//!   genie-ctl bfcl-score-llm --cases CASES.jsonl [--out PREDS.jsonl] [--min-strict PCT]
 //!                              Generate and score local LLM tool-call predictions
+//!                              (--min-strict fails when strict accuracy < PCT)
 //!   genie-ctl bfcl-import-ha-intents --source INTENTS_DIR --out CASES.jsonl
 //!                              Convert Home Assistant Intents into BFCL cases
 //!   genie-ctl skill ...       Manage loadable skill modules
@@ -261,8 +262,9 @@ COMMANDS:
     bfcl-score --cases C --predictions P [--json] [--min-strict PCT]
                         Score tool-call accuracy from JSONL fixtures
                         (--min-strict PCT fails when strict accuracy < PCT)
-    bfcl-score-llm --cases C [--out P] [--json] [--max-tokens N] [--limit N]
+    bfcl-score-llm --cases C [--out P] [--json] [--max-tokens N] [--limit N] [--min-strict PCT]
                         Generate and score local LLM predictions without executing tools
+                        (--min-strict PCT fails when strict accuracy < PCT)
     bfcl-predict-quick --cases C --out P
                         Generate deterministic quick-router predictions
     bfcl-predict-llm --cases C --out P [--max-tokens N] [--limit N]
@@ -997,7 +999,7 @@ struct BfclScoreArgs {
     min_strict: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct BfclScoreLlmArgs {
     cases: PathBuf,
     out: Option<PathBuf>,
@@ -1005,6 +1007,8 @@ struct BfclScoreLlmArgs {
     limit: Option<usize>,
     json_mode: bool,
     json: bool,
+    /// Fail (non-zero exit) when strict accuracy falls below this percentage.
+    min_strict: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1173,6 +1177,7 @@ fn parse_bfcl_score_llm_args(args: &[String]) -> Result<BfclScoreLlmArgs> {
     let mut limit = None;
     let mut json_mode = true;
     let mut json = false;
+    let mut min_strict = None;
     let mut idx = 0;
 
     while idx < args.len() {
@@ -1218,6 +1223,13 @@ fn parse_bfcl_score_llm_args(args: &[String]) -> Result<BfclScoreLlmArgs> {
                 json = true;
                 idx += 1;
             }
+            "--min-strict" => {
+                let Some(value) = args.get(idx + 1) else {
+                    anyhow::bail!("--min-strict requires a percentage value (0-100)");
+                };
+                min_strict = Some(parse_min_strict(value)?);
+                idx += 2;
+            }
             _ if arg.starts_with("--cases=") => {
                 cases = Some(PathBuf::from(arg.trim_start_matches("--cases=")));
                 idx += 1;
@@ -1254,13 +1266,17 @@ fn parse_bfcl_score_llm_args(args: &[String]) -> Result<BfclScoreLlmArgs> {
                 )?);
                 idx += 1;
             }
+            _ if arg.starts_with("--min-strict=") => {
+                min_strict = Some(parse_min_strict(arg.trim_start_matches("--min-strict="))?);
+                idx += 1;
+            }
             other => anyhow::bail!("unknown bfcl-score-llm option: {}", other),
         }
     }
 
     let Some(cases) = cases else {
         anyhow::bail!(
-            "Usage: genie-ctl bfcl-score-llm --cases CASES.jsonl [--out PREDICTIONS.jsonl] [--json] [--max-tokens N] [--limit N]"
+            "Usage: genie-ctl bfcl-score-llm --cases CASES.jsonl [--out PREDICTIONS.jsonl] [--json] [--max-tokens N] [--limit N] [--min-strict PCT]"
         );
     };
 
@@ -1271,6 +1287,7 @@ fn parse_bfcl_score_llm_args(args: &[String]) -> Result<BfclScoreLlmArgs> {
         limit,
         json_mode,
         json,
+        min_strict,
     })
 }
 
@@ -1546,17 +1563,18 @@ async fn cmd_bfcl_score_llm(args: &BfclScoreLlmArgs) -> Result<()> {
                 "report": report,
             }))?
         );
-        return Ok(());
+    } else {
+        println!("BFCL local-LLM tool-call score");
+        println!("backend:             {}", run.backend);
+        println!("generated_predictions: {}", run.predictions.len());
+        println!("tool_calls:          {}", run.tool_calls);
+        if let Some(out) = &args.out {
+            println!("predictions:         {}", out.display());
+        }
+        print_bfcl_report_metrics(&report);
     }
 
-    println!("BFCL local-LLM tool-call score");
-    println!("backend:             {}", run.backend);
-    println!("generated_predictions: {}", run.predictions.len());
-    println!("tool_calls:          {}", run.tool_calls);
-    if let Some(out) = &args.out {
-        println!("predictions:         {}", out.display());
-    }
-    print_bfcl_report_metrics(&report);
+    enforce_min_strict(args.min_strict, &report)?;
 
     Ok(())
 }
@@ -2097,15 +2115,10 @@ async fn cmd_update_check() -> Result<()> {
             println!("  Latest:  {}", tag);
             println!("  Published: {}", published);
 
-            let latest_clean = tag
-                .strip_prefix('v')
-                .unwrap_or(tag)
-                .split('-')
-                .next()
-                .unwrap_or(tag);
-            let current_clean = current.split('-').next().unwrap_or(current);
-
-            if latest_clean > current_clean {
+            // Compare with full SemVer precedence (numeric components compare
+            // numerically, so 1.10.0 > 1.9.0). A plain string compare gets this
+            // backwards; reuse the same comparator the OTA checker uses.
+            if genie_core::ota::version_is_newer(tag, current) {
                 println!("\n  Update available! Download from:");
                 println!(
                     "  https://github.com/GeniePod/genie-claw/releases/tag/{}",
@@ -2235,7 +2248,7 @@ async fn cmd_diag() -> Result<()> {
         && let Some(secs) = uptime.split_whitespace().next()
         && let Ok(s) = secs.parse::<f64>()
     {
-        println!("  Uptime: {:.0}h {:.0}m", s / 3600.0, (s % 3600.0) / 60.0);
+        println!("  Uptime: {}", format_uptime_hm(s as u64));
     }
 
     // Disk.
@@ -2705,6 +2718,14 @@ async fn governor_cmd(json: &str) -> Option<serde_json::Value> {
     line.and_then(|l| serde_json::from_str(&l).ok())
 }
 
+/// Format elapsed seconds as "<h>h <m>m", flooring each component like the
+/// governor status/uptime lines. The `diag` command formerly rounded each
+/// component with `{:.0}`, so a 50-minute uptime printed "1h 50m" (the hour
+/// field rounded up off the minutes) instead of "0h 50m".
+fn format_uptime_hm(total_secs: u64) -> String {
+    format!("{}h {}m", total_secs / 3600, (total_secs % 3600) / 60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2715,6 +2736,14 @@ mod tests {
 
     fn default_test_config() -> Config {
         toml::from_str("").expect("default config should parse from empty TOML")
+    }
+
+    #[test]
+    fn format_uptime_hm_floors_each_component() {
+        assert_eq!(format_uptime_hm(3000), "0h 50m");
+        assert_eq!(format_uptime_hm(5400), "1h 30m");
+        assert_eq!(format_uptime_hm(3599), "0h 59m");
+        assert_eq!(format_uptime_hm(3600), "1h 0m");
     }
 
     fn expect_probe_target(target: &ServiceProbeTarget) -> (&str, &str, bool) {
@@ -3154,6 +3183,32 @@ mod tests {
         assert_eq!(parsed.limit, Some(40));
         assert!(parsed.json);
         assert!(!parsed.json_mode);
+        assert_eq!(parsed.min_strict, None);
+    }
+
+    #[test]
+    fn parse_bfcl_score_llm_args_parses_min_strict_threshold() {
+        let space = vec![
+            "--cases=cases.jsonl".to_string(),
+            "--min-strict".to_string(),
+            "96".to_string(),
+        ];
+        let equals = vec![
+            "--cases=cases.jsonl".to_string(),
+            "--min-strict=96.5".to_string(),
+        ];
+
+        assert_eq!(
+            parse_bfcl_score_llm_args(&space).unwrap().min_strict,
+            Some(96.0)
+        );
+        assert_eq!(
+            parse_bfcl_score_llm_args(&equals).unwrap().min_strict,
+            Some(96.5)
+        );
+        // Absent by default so the gate stays opt-in.
+        let bare = vec!["--cases=cases.jsonl".to_string()];
+        assert_eq!(parse_bfcl_score_llm_args(&bare).unwrap().min_strict, None);
     }
 
     #[test]
