@@ -701,21 +701,6 @@ async fn run_push_to_talk(
         lines: tokio::io::BufReader::new(tokio::io::stdin()).lines(),
         pending: std::sync::Arc::clone(&pending),
     };
-        let should_continue = voice_cycle(
-            voice_cfg,
-            audio_device,
-            stt_engine,
-            llm,
-            tools,
-            memory,
-            conversations,
-            system_prompt,
-            max_history,
-            model_family,
-            conv_id,
-            session_registry,
-        )
-        .await;
 
     crate::channel::serve_channel(&mut channel, |turn| {
         let pending = std::sync::Arc::clone(&pending);
@@ -740,6 +725,7 @@ async fn run_push_to_talk(
                     max_history,
                     model_family,
                     conv_id,
+                    session_registry,
                     wav_path: Some(&utterance.wav_path),
                     tts_engine_override: None,
                     t_preprocess_done: utterance.t_preprocess_done,
