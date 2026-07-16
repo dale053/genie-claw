@@ -195,6 +195,8 @@ async function pollRuntimeContract() {
   setText('contract-model', data.model_family || '--');
   setText('contract-tools', data.tool_count ?? '--');
   setText('contract-prompt', data.prompt_hash || '--');
+  const activeChannels = data.hydration?.channels?.active;
+  setText('contract-channels', Array.isArray(activeChannels) && activeChannels.length ? activeChannels.join(', ') : '--');
   const validation = data.validation || {};
   const status = validation.status || 'unknown';
   const driftText = validation.drift ? ' · DRIFT' : '';

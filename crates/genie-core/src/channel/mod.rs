@@ -242,6 +242,41 @@ impl ChannelRegistry {
     }
 }
 
+/// Registration-only marker for a transport that is live in this process but
+/// not yet itself driven through `Channel`/`serve_channel` (#785).
+///
+/// `main.rs` registers one of these per transport it actually starts (voice,
+/// HTTP, Telegram) purely so `ChannelRegistry::kinds()` can report which
+/// channel(s) are active — e.g. via the runtime contract's hydration snapshot
+/// — even before every transport's own `recv`/`send` loop is ported (#700,
+/// #701). `recv`/`send` are unreachable: the real transport loop runs
+/// elsewhere (`voice_loop::run`, `ChatServer::serve`, `telegram::run`), and
+/// `ChannelRegistry` itself never drives a registered channel — see its own
+/// doc comment. As each transport's real port lands, replace its
+/// `ActiveChannelMarker` registration with the live `Channel` object.
+pub struct ActiveChannelMarker(pub ChannelKind);
+
+#[async_trait]
+impl Channel for ActiveChannelMarker {
+    fn kind(&self) -> ChannelKind {
+        self.0
+    }
+
+    async fn recv(&mut self) -> Option<IncomingTurn> {
+        unreachable!(
+            "ActiveChannelMarker is registration-only; the real {} transport loop runs elsewhere",
+            self.0.as_str()
+        )
+    }
+
+    async fn send(&mut self, _response: OutgoingResponse) -> Result<()> {
+        unreachable!(
+            "ActiveChannelMarker is registration-only; the real {} transport loop runs elsewhere",
+            self.0.as_str()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +420,30 @@ mod tests {
                 ChannelKind::Telegram
             ]
         );
+    }
+
+    #[test]
+    fn active_channel_marker_reports_its_kind() {
+        let marker = ActiveChannelMarker(ChannelKind::Http);
+        assert_eq!(marker.kind(), ChannelKind::Http);
+    }
+
+    #[test]
+    fn active_channel_marker_registers_into_channel_registry() {
+        let mut registry = ChannelRegistry::new();
+        registry.register(Box::new(ActiveChannelMarker(ChannelKind::Http)));
+        registry.register(Box::new(ActiveChannelMarker(ChannelKind::Telegram)));
+
+        assert_eq!(
+            registry.kinds(),
+            vec![ChannelKind::Http, ChannelKind::Telegram]
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "registration-only")]
+    async fn active_channel_marker_recv_is_unreachable() {
+        let mut marker = ActiveChannelMarker(ChannelKind::Voice);
+        let _ = marker.recv().await;
     }
 }
