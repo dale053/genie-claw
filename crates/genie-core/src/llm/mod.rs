@@ -19,7 +19,9 @@ pub use escalation::{
 };
 pub use genie_ai_runtime::GenieAiRuntimeBackend;
 pub use llama_cpp::LlamaCppBackend;
-pub use local_provider::{GatedProvider, LocalProvider, Provider, gated_provider_from_config};
+pub use local_provider::{
+    GatedProvider, LocalProvider, Provider, gated_provider_for_http, gated_provider_from_config,
+};
 pub use mock::MockLlmBackend;
 pub use openai_compat::{LlmTimeouts, Message, ResponseFormat};
 pub use openai_compatible::OpenAiCompatibleBackend;
@@ -169,9 +171,10 @@ impl LlmClient {
                 match provider.provider {
                     OptionalAiProviderKind::OpenAiCompatible | OptionalAiProviderKind::OpenAi => {
                         Ok(
-                            Self::from_openai_compatible_url_with_bearer_token_env_and_timeouts(
+                            Self::from_openai_compatible_url_with_bearer_token_env_and_model(
                                 provider.base_url.trim(),
                                 provider.credential_env(),
+                                provider.model.trim(),
                                 timeouts,
                             ),
                         )
@@ -253,6 +256,25 @@ impl LlmClient {
             env_var,
             LlmTimeouts::default(),
         )
+    }
+
+    /// Same as [`Self::from_openai_compatible_url_with_bearer_token_env_and_timeouts`],
+    /// but with an operator-configured `model` instead of the `"default"`
+    /// placeholder (#620) — used by [`Self::from_config`] for the optional
+    /// OpenAI-compatible provider path.
+    pub fn from_openai_compatible_url_with_bearer_token_env_and_model(
+        url: &str,
+        env_var: impl AsRef<str>,
+        model: impl Into<String>,
+        timeouts: LlmTimeouts,
+    ) -> Self {
+        Self {
+            backend: Box::new(
+                OpenAiCompatibleBackend::from_url_with_bearer_token_env_and_model(
+                    url, env_var, model, timeouts,
+                ),
+            ),
+        }
     }
 
     pub fn from_openai_compatible_url_with_bearer_token_env_and_timeouts(

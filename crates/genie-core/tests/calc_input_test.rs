@@ -58,6 +58,17 @@ fn integer_math_is_unchanged() {
 }
 
 #[test]
+fn thousands_separator_comma_is_not_a_split() {
+    // A comma between digits is a thousands separator, not a token break. Left as
+    // a separator, "1,000" became "1 000" and the calculator took only "1".
+    assert_eq!(expression("what's 20 percent of 1,000"), "1000 * 20 / 100");
+    assert_eq!(expression("what is 15 percent of 1,500"), "1500 * 15 / 100");
+    assert_eq!(expression("what is 1,000,000 divided by 4"), "1000000 / 4");
+    // A decimal point between digits is still a decimal point (unchanged).
+    assert_eq!(expression("what is 3.5 plus 2.5"), "3.5 + 2.5");
+}
+
+#[test]
 fn spoken_cardinals_in_percentage_and_temperature() {
     assert_eq!(expression("what is twenty percent of 80"), "80 * 20 / 100");
     assert_eq!(expression("what is 20 percent of eighty"), "80 * 20 / 100");
@@ -103,6 +114,21 @@ fn article_before_amount_is_not_the_percentage_base() {
         "150 * 20 / 100"
     );
     assert_eq!(expression("what is 20 percent of a dollar"), "1 * 20 / 100");
+}
+
+#[test]
+fn definite_article_before_percentage_base_is_not_the_amount() {
+    // "20 percent of the 50 dollar bill" means 50. Like "a"/"an", the definite
+    // article "the" precedes the amount; without skipping it the percentage
+    // abstained entirely instead of reading the number that follows.
+    assert_eq!(
+        expression("what is 20 percent of the 50 dollar bill"),
+        "50 * 20 / 100"
+    );
+    assert_eq!(
+        expression("what is 15 percent of the 80 dollar order"),
+        "80 * 15 / 100"
+    );
 }
 
 #[test]

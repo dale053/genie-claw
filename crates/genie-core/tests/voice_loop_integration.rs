@@ -47,6 +47,7 @@ use genie_core::conversation::ConversationStore;
 use genie_core::llm::{LlmClient, Message};
 use genie_core::memory::{Memory, SharedMemory};
 use genie_core::prompt::ModelFamily;
+use genie_core::session::SessionRegistry;
 use genie_core::tools::{ToolDispatcher, ToolExecutionContext, try_tool_call_with_context};
 use genie_core::voice::identity::SpeakerIdentityProvider;
 use genie_core::voice::streaming::stream_and_speak;
@@ -401,11 +402,6 @@ async fn process_transcript_drives_full_voice_cycle_with_mocks() {
     let dir = unique_dir("process-transcript");
     let memory: SharedMemory = Arc::new(Mutex::new(Memory::open(&dir.join("memory.db")).unwrap()));
     let conversations = ConversationStore::open(&dir.join("conversations.db")).unwrap();
-    let conv_id = "voice-it-process";
-    conversations
-        .ensure(conv_id, "process_transcript integration")
-        .await
-        .unwrap();
 
     let audit_path = dir.join("tool-audit.jsonl");
     let tools = ToolDispatcher::new(None).with_tool_audit_path(audit_path.clone());
@@ -428,6 +424,7 @@ async fn process_transcript_drives_full_voice_cycle_with_mocks() {
         language: None,
     };
 
+    let session_registry = tokio::sync::Mutex::new(SessionRegistry::with_defaults());
     let kept_running = process_transcript(
         transcript,
         ProcessTranscriptInputs {
@@ -440,7 +437,7 @@ async fn process_transcript_drives_full_voice_cycle_with_mocks() {
             system_prompt: "You are GeniePod, a household assistant.",
             max_history: 8,
             model_family: ModelFamily::Phi,
-            conv_id,
+            session_registry: &session_registry,
             wav_path: None,
             tts_engine_override: Some(&tts),
             t_preprocess_done: std::time::Instant::now(),
@@ -450,9 +447,17 @@ async fn process_transcript_drives_full_voice_cycle_with_mocks() {
 
     assert!(kept_running, "process_transcript should return true");
 
+    // (voice #702) the processed turn enrolled its (voice, speaker) session in
+    // the bounded session registry, so voice counts against the Jetson budget.
+    assert_eq!(
+        session_registry.lock().await.len(),
+        1,
+        "a processed voice turn should enroll exactly one session"
+    );
+
     // (a) Transcript flow — the user message ended up in the conversation
     //     store, sourced from the transcript text.
-    let history = conversations.get_recent(conv_id, 10).await.unwrap();
+    let history = conversations.get_recent("voice:unknown", 10).await.unwrap();
     assert!(
         history
             .iter()
@@ -495,11 +500,6 @@ async fn process_transcript_ignores_empty_transcript() {
     let dir = unique_dir("process-empty");
     let memory: SharedMemory = Arc::new(Mutex::new(Memory::open(&dir.join("memory.db")).unwrap()));
     let conversations = ConversationStore::open(&dir.join("conversations.db")).unwrap();
-    let conv_id = "voice-it-empty";
-    conversations
-        .ensure(conv_id, "empty transcript")
-        .await
-        .unwrap();
 
     // LLM with zero replies — if process_transcript reaches it, the call
     // errors and the test fails to maintain its invariants.
@@ -514,6 +514,7 @@ async fn process_transcript_ignores_empty_transcript() {
         language: None,
     };
 
+    let session_registry = tokio::sync::Mutex::new(SessionRegistry::with_defaults());
     let kept_running = process_transcript(
         transcript,
         ProcessTranscriptInputs {
@@ -526,7 +527,7 @@ async fn process_transcript_ignores_empty_transcript() {
             system_prompt: "",
             max_history: 8,
             model_family: ModelFamily::Phi,
-            conv_id,
+            session_registry: &session_registry,
             wav_path: None,
             tts_engine_override: Some(&tts),
             t_preprocess_done: std::time::Instant::now(),
@@ -535,9 +536,82 @@ async fn process_transcript_ignores_empty_transcript() {
     .await;
 
     assert!(kept_running);
-    let history = conversations.get_recent(conv_id, 10).await.unwrap();
+    let history = conversations.get_recent("voice:unknown", 10).await.unwrap();
     assert!(
         history.is_empty(),
         "no messages should be appended for empty transcript"
     );
+}
+
+#[tokio::test]
+async fn process_transcript_isolates_history_per_speaker() {
+    use genie_core::memory::policy::IdentityConfidence;
+    use genie_core::voice::identity::SpeakerIdentity;
+
+    let dir = unique_dir("process-speakers");
+    let memory: SharedMemory = Arc::new(Mutex::new(Memory::open(&dir.join("memory.db")).unwrap()));
+    let conversations = ConversationStore::open(&dir.join("conversations.db")).unwrap();
+    let tools = ToolDispatcher::new(None);
+    let tts = TtsEngine::silent();
+    let session_registry = tokio::sync::Mutex::new(SessionRegistry::with_defaults());
+
+    for (name, prompt, reply) in [
+        ("alice", "alice says hello", "hi alice"),
+        ("bob", "bob says hello", "hi bob"),
+    ] {
+        let mut voice_cfg = test_voice_config();
+        voice_cfg.speaker_identity = SpeakerIdentityProvider::Fixed(SpeakerIdentity {
+            name: Some(name.into()),
+            confidence: IdentityConfidence::High,
+        });
+        let llm = LlmClient::mock([reply]);
+        let transcript = Transcript {
+            text: prompt.into(),
+            duration_ms: 0,
+            language: None,
+        };
+        let kept = process_transcript(
+            transcript,
+            ProcessTranscriptInputs {
+                voice_cfg: &voice_cfg,
+                audio_device: "",
+                llm: &llm,
+                tools: &tools,
+                memory: &memory,
+                conversations: &conversations,
+                system_prompt: "You are GeniePod.",
+                max_history: 8,
+                model_family: ModelFamily::Phi,
+                session_registry: &session_registry,
+                wav_path: None,
+                tts_engine_override: Some(&tts),
+                t_preprocess_done: std::time::Instant::now(),
+            },
+        )
+        .await;
+        assert!(kept);
+    }
+
+    let alice = conversations.get_recent("voice:alice", 10).await.unwrap();
+    let bob = conversations.get_recent("voice:bob", 10).await.unwrap();
+    assert!(
+        alice
+            .iter()
+            .any(|m| m.role == "user" && m.content == "alice says hello"),
+        "alice history missing alice turn: {alice:?}"
+    );
+    assert!(
+        !alice.iter().any(|m| m.content.contains("bob")),
+        "alice history must not include bob turns: {alice:?}"
+    );
+    assert!(
+        bob.iter()
+            .any(|m| m.role == "user" && m.content == "bob says hello"),
+        "bob history missing bob turn: {bob:?}"
+    );
+    assert!(
+        !bob.iter().any(|m| m.content.contains("alice")),
+        "bob history must not include alice turns: {bob:?}"
+    );
+    assert_eq!(session_registry.lock().await.len(), 2);
 }
