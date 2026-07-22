@@ -32,8 +32,9 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
                 continue;
             }
             let fact = format!("User's {} is {}", key, text);
-            if !memory.has_similar(&fact).unwrap_or(false) {
-                memory.store_evergreen("identity", &fact)?;
+            if !memory.has_similar(&fact).unwrap_or(false)
+                && super::store_evergreen_if_allowed(memory, "identity", &fact)
+            {
                 stored += 1;
             }
         }
@@ -50,8 +51,9 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
                 toml::Value::Array(_) => format!("User's {} preferences: {}", key, text),
                 _ => format!("User prefers {} {}", key, text),
             };
-            if !memory.has_similar(&fact).unwrap_or(false) {
-                memory.store_evergreen("preference", &fact)?;
+            if !memory.has_similar(&fact).unwrap_or(false)
+                && super::store_evergreen_if_allowed(memory, "preference", &fact)
+            {
                 stored += 1;
             }
         }
@@ -66,8 +68,9 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
                     continue;
                 }
                 let fact = format!("User's {} is {}", relation, text);
-                if !memory.has_similar(&fact).unwrap_or(false) {
-                    memory.store_evergreen("relationship", &fact)?;
+                if !memory.has_similar(&fact).unwrap_or(false)
+                    && super::store_evergreen_if_allowed(memory, "relationship", &fact)
+                {
                     stored += 1;
                 }
             }
@@ -82,8 +85,9 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
                 continue;
             }
             let fact = format!("{} routine: {}", name, text);
-            if !memory.has_similar(&fact).unwrap_or(false) {
-                memory.store_evergreen("context", &fact)?;
+            if !memory.has_similar(&fact).unwrap_or(false)
+                && super::store_evergreen_if_allowed(memory, "context", &fact)
+            {
                 stored += 1;
             }
         }
@@ -97,8 +101,9 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
                 continue;
             }
             let fact = format!("User's work {}: {}", key, text);
-            if !memory.has_similar(&fact).unwrap_or(false) {
-                memory.store_evergreen("identity", &fact)?;
+            if !memory.has_similar(&fact).unwrap_or(false)
+                && super::store_evergreen_if_allowed(memory, "identity", &fact)
+            {
                 stored += 1;
             }
         }
@@ -112,8 +117,9 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
             if sentence.len() > 10 {
                 let facts = crate::memory::extract::extract_facts(sentence);
                 for fact in facts {
-                    if !memory.has_similar(&fact.content).unwrap_or(false) {
-                        memory.store_evergreen(&fact.category, &fact.content)?;
+                    if !memory.has_similar(&fact.content).unwrap_or(false)
+                        && super::store_evergreen_if_allowed(memory, &fact.category, &fact.content)
+                    {
                         stored += 1;
                     }
                 }
@@ -125,18 +131,28 @@ pub fn load_toml_profile(path: &Path, memory: &Memory) -> Result<usize> {
 }
 
 /// Convert a TOML value to a display string.
+///
+/// Every scalar TOML can hold renders, including dates and times — a profile
+/// realistically carries `birthday = 1990-05-15` or `wake = 06:30:00`. Arrays
+/// render element-wise with these same rules, so `[7, 13]` renders the way the
+/// `7` and `13` scalars do. Only a nested table has no display form and yields
+/// an empty string, which callers treat as "skip this key". The match is
+/// exhaustive on purpose: a catch-all previously swallowed `Datetime`, so those
+/// facts were dropped without a trace.
 fn value_to_string(value: &toml::Value) -> String {
     match value {
         toml::Value::String(s) => s.clone(),
         toml::Value::Integer(n) => n.to_string(),
         toml::Value::Float(f) => f.to_string(),
         toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Datetime(d) => d.to_string(),
         toml::Value::Array(arr) => arr
             .iter()
-            .filter_map(|v| v.as_str())
+            .map(value_to_string)
+            .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join(", "),
-        _ => String::new(),
+        toml::Value::Table(_) => String::new(),
     }
 }
 
@@ -146,6 +162,28 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// Render the single value in a one-key TOML document.
+    fn render(src: &str) -> String {
+        let doc: toml::Value = src.parse().unwrap();
+        let table = doc.as_table().unwrap();
+        let (_, value) = table.iter().next().unwrap();
+        value_to_string(value)
+    }
+
+    #[test]
+    fn value_to_string_renders_datetimes_and_non_string_arrays() {
+        // Dates/times are scalars a personal profile holds (birthday, wake
+        // time). A catch-all arm used to render them "", so load_toml_profile
+        // silently skipped the fact. Arrays render element-wise like scalars.
+        assert_eq!(render("birthday = 1990-05-15"), "1990-05-15");
+        assert_eq!(render("wake = 06:30:00"), "06:30:00");
+        assert_eq!(render("lucky = [7, 13]"), "7, 13");
+        assert_eq!(render("mixed = [\"jazz\", 5]"), "jazz, 5");
+        // Unchanged for the scalars that already worked.
+        assert_eq!(render("age = 32"), "32");
+        assert_eq!(render("music = [\"jazz\", \"lo-fi\"]"), "jazz, lo-fi");
+    }
 
     fn temp_memory() -> Memory {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -255,6 +293,30 @@ name = "Jared"
         let count2 = load_toml_profile(&dir.join("profile.toml"), &mem).unwrap();
         assert_eq!(count1, 1);
         assert_eq!(count2, 0, "second load should be deduplicated");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rejects_restricted_secret_content() {
+        let mem = temp_memory();
+        let dir = std::env::temp_dir().join(format!("geniepod-secret-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        std::fs::write(
+            dir.join("profile.toml"),
+            r#"about = "The gate code is 5829.""#,
+        )
+        .unwrap();
+
+        let count = load_toml_profile(&dir.join("profile.toml"), &mem).unwrap();
+        assert_eq!(
+            count, 0,
+            "restricted secrets must not be stored from profile.toml"
+        );
+
+        let results = mem.search("5829", 10).unwrap();
+        assert!(results.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

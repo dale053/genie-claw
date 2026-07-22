@@ -77,10 +77,16 @@ function setText(id, val) {
   if (el) el.textContent = val;
 }
 
+// Local API token for authenticated API calls (issue #228). genie-api injects
+// it into the meta tag; left blank when token enforcement is disabled.
+const LOCAL_TOKEN = document.querySelector('meta[name="genie-local-token"]')?.content || '';
+
 // --- Fetch helpers ---
 async function fetchJson(url) {
   try {
-    const r = await fetch(url);
+    const headers = {};
+    if (LOCAL_TOKEN) headers['X-Genie-Token'] = LOCAL_TOKEN;
+    const r = await fetch(url, { headers });
     return await r.json();
   } catch {
     return null;
@@ -195,6 +201,8 @@ async function pollRuntimeContract() {
   setText('contract-model', data.model_family || '--');
   setText('contract-tools', data.tool_count ?? '--');
   setText('contract-prompt', data.prompt_hash || '--');
+  const activeChannels = data.hydration?.channels?.active;
+  setText('contract-channels', Array.isArray(activeChannels) && activeChannels.length ? activeChannels.join(', ') : '--');
   const validation = data.validation || {};
   const status = validation.status || 'unknown';
   const driftText = validation.drift ? ' · DRIFT' : '';
@@ -229,10 +237,6 @@ async function pollSecurity() {
   setText('security-risk-count', riskFlags.length);
   setText('security-detail', details);
 }
-
-// Local API token for mutating calls (issue #228). genie-api injects it into
-// the meta tag; left blank when token enforcement is disabled.
-const LOCAL_TOKEN = document.querySelector('meta[name="genie-local-token"]')?.content || '';
 
 async function postJson(url, payload) {
   const headers = { 'Content-Type': 'application/json' };
