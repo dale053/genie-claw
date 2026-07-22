@@ -184,7 +184,9 @@ struct AreaTemplateEntry {
 
 #[derive(Debug, Clone)]
 struct CachedGraph {
-    graph: HomeGraph,
+    // `Arc` so a cache hit shares the graph by refcount bump instead of
+    // deep-cloning every entity/alias on every home request.
+    graph: Arc<HomeGraph>,
     synced_at: Instant,
 }
 
@@ -200,13 +202,15 @@ impl HomeAssistantProvider {
         Ok(Self::new(HaClient::from_url(url, token)?))
     }
 
-    async fn graph(&self) -> Result<(HomeGraph, bool)> {
+    async fn graph(&self) -> Result<(Arc<HomeGraph>, bool)> {
         if let Some(cached) = self.cache.read().await.clone()
             && cached.synced_at.elapsed() < GRAPH_CACHE_TTL
         {
+            // Cloning the cached `CachedGraph` now only bumps the `Arc`
+            // refcount (and copies the `Instant`), not the whole graph.
             return Ok((cached.graph, true));
         }
-        Ok((self.sync_structure().await?, false))
+        Ok((Arc::new(self.sync_structure().await?), false))
     }
 
     async fn load_areas(&self) -> Result<Vec<AreaTemplateEntry>> {
@@ -342,11 +346,29 @@ impl HomeAssistantProvider {
         let area_match = best_area_match(&graph.areas, &query_lower);
         let domain_match = infer_domain(&query_lower);
 
-        if let (Some((area_name, area_score)), Some(domain)) = (area_match.clone(), domain_match)
-            && let Some(target) =
-                Self::resolve_group_target(graph, query, &domain, &area_name, area_score)
-        {
-            return Some(target);
+        if let (Some((area_name, area_score)), Some(domain)) = (area_match.clone(), domain_match) {
+            if query_is_bare_area_domain(&query_lower, &area_name, &domain) {
+                // Bare "<area> <domain>" (e.g. "living room lights") means the
+                // whole-room group.
+                if let Some(target) =
+                    Self::resolve_group_target(graph, query, &domain, &area_name, area_score)
+                {
+                    return Some(target);
+                }
+            } else {
+                // An extra descriptive token (e.g. "living room floor lamp")
+                // names one device in the room, not the whole group. Resolve it
+                // by name first; only fall back to the room group if nothing
+                // named matches.
+                if let Some(target) = Self::resolve_named_entity(graph, query, action_hint) {
+                    return Some(target);
+                }
+                if let Some(target) =
+                    Self::resolve_group_target(graph, query, &domain, &area_name, area_score)
+                {
+                    return Some(target);
+                }
+            }
         }
 
         let domain_match = infer_domain(&query_lower);
@@ -625,7 +647,7 @@ impl HomeAutomationProvider for HomeAssistantProvider {
 
         let graph = Self::build_graph(&states, &areas);
         *self.cache.write().await = Some(CachedGraph {
-            graph: graph.clone(),
+            graph: Arc::new(graph.clone()),
             synced_at: Instant::now(),
         });
         Ok(graph)
@@ -838,12 +860,13 @@ impl HomeAutomationProvider for HomeAssistantProvider {
         let room = room.map(normalize);
         Ok(graph
             .scenes
-            .into_iter()
+            .iter()
             .filter(|scene| match (&room, &scene.area) {
                 (Some(room), Some(area)) => normalize(area) == *room,
                 (Some(_), None) => false,
                 (None, _) => true,
             })
+            .cloned()
             .collect())
     }
 
@@ -852,12 +875,13 @@ impl HomeAutomationProvider for HomeAssistantProvider {
         let room = room.map(normalize);
         Ok(graph
             .devices
-            .into_iter()
+            .iter()
             .filter(|device| match (&room, &device.area) {
                 (Some(room), Some(area)) => normalize(area) == *room,
                 (Some(_), None) => false,
                 (None, _) => true,
             })
+            .cloned()
             .collect())
     }
 }
@@ -945,15 +969,25 @@ fn capabilities_for(domain: &str, attributes: &serde_json::Value) -> Vec<String>
     caps
 }
 
+/// Whether the operator explicitly opted this script in to voice activation.
+///
+/// The punctuated markers are matched against the lowercased raw text, not the
+/// `normalize`d text: `normalize` rewrites every non-alphanumeric byte to a
+/// space, so "[voice]", "(voice)", "voice_" and "genie_" can never occur in its
+/// output and those arms never fired. Matching them on the raw text keeps each
+/// marker's spelling exact — a bare "voice" anywhere in a name still does not
+/// opt a script in, so the gate stays closed for everything unmarked.
 fn is_voice_safe_script(entity: &Entity) -> bool {
+    let raw_name = entity.friendly_name().to_lowercase();
+    let raw_entity_id = entity.entity_id.to_lowercase();
     let name = normalize(entity.friendly_name());
     let entity_id = normalize(&entity.entity_id.replace('.', " "));
-    name.contains("[voice]")
-        || name.contains("(voice)")
+    raw_name.contains("[voice]")
+        || raw_name.contains("(voice)")
         || name.starts_with("voice ")
         || entity_id.contains(" voice ")
-        || entity_id.contains("voice_")
-        || entity_id.contains("genie_")
+        || raw_entity_id.contains("voice_")
+        || raw_entity_id.contains("genie_")
 }
 
 fn domain_synonyms(domain: &str) -> Vec<String> {
@@ -1083,6 +1117,27 @@ fn ambiguous_named_entity_candidates(graph: &HomeGraph, query: &str) -> Option<V
     } else {
         None
     }
+}
+
+/// Whether `query_lower` is a bare "<area> <domain>" phrase — every token is
+/// accounted for by the matched area's name, a synonym of the inferred domain,
+/// or a domain word. "living room lights" is bare and means the whole-room
+/// group; "living room floor lamp" carries the extra token "floor", which names
+/// one specific device in the room, so it must not collapse to every light.
+fn query_is_bare_area_domain(query_lower: &str, area_name: &str, domain: &str) -> bool {
+    let area_tokens: HashSet<String> = normalize(area_name)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let domain_tokens: HashSet<String> = domain_synonyms(domain)
+        .iter()
+        .flat_map(|synonym| synonym.split_whitespace().map(str::to_string))
+        .collect();
+    query_lower.split_whitespace().all(|token| {
+        area_tokens.contains(token)
+            || domain_tokens.contains(token)
+            || entity_fidelity::domain_of_word(token) == Some(domain)
+    })
 }
 
 fn best_area_match(areas: &[AreaRef], query: &str) -> Option<(String, f32)> {
@@ -1501,6 +1556,50 @@ mod tests {
     }
 
     #[test]
+    fn voice_safe_script_markers_survive_normalization() {
+        // `normalize` maps every non-alphanumeric byte to a space, so a marker
+        // spelled with punctuation never survives to be matched: "[voice]",
+        // "(voice)", "voice_" and "genie_" could not appear in its output, and
+        // those four arms were unreachable. Only the two space-delimited forms
+        // ("Voice ..." / "script.voice_...", the latter via " voice ") ever fired,
+        // so a script the operator explicitly opted in with a "[Voice]" tag or a
+        // `genie_` id was reported as NOT voice-safe -- and since #773 that is a
+        // hard deny with no confirmation escape hatch, making the script
+        // unreachable by voice entirely.
+        let script = |id: &str, name: &str| Entity {
+            entity_id: id.into(),
+            state: "off".into(),
+            attributes: serde_json::json!({ "friendly_name": name }),
+        };
+
+        // Explicit opt-in markers are honored.
+        for (id, name) in [
+            ("script.goodnight", "Goodnight [Voice]"),
+            ("script.goodnight", "Goodnight (Voice)"),
+            ("script.genie_goodnight", "Goodnight"),
+            ("script.voice_goodnight", "Goodnight"),
+            ("script.goodnight", "Voice Goodnight"),
+        ] {
+            assert!(
+                is_voice_safe_script(&script(id, name)),
+                "expected voice-safe: {id} / {name:?}"
+            );
+        }
+
+        // An unmarked script stays non-voice-safe: the gate still fails closed
+        // for anything the operator did not opt in.
+        for (id, name) in [
+            ("script.disarm_alarm", "Disarm Alarm"),
+            ("script.open_garage", "Open Garage"),
+        ] {
+            assert!(
+                !is_voice_safe_script(&script(id, name)),
+                "expected NOT voice-safe: {id} / {name:?}"
+            );
+        }
+    }
+
+    #[test]
     fn build_graph_admits_fan_entities_and_resolves_them() {
         // Regression: `fan` is a controllable domain in the quick router and
         // `infer_domain`, but `is_voice_relevant_domain` omitted it, so
@@ -1617,6 +1716,53 @@ mod tests {
         assert_eq!(target.kind, HomeTargetKind::Group);
         assert_eq!(target.domain.as_deref(), Some("light"));
         assert_eq!(target.entity_ids, vec!["light.living_room_lamp"]);
+    }
+
+    #[test]
+    fn resolve_prefers_named_device_over_room_group() {
+        // Regression: a room with two lights. "living room floor lamp" names a
+        // single device and used to collapse to the whole-room group (both
+        // lights turn on). It must resolve to only the floor lamp, while a bare
+        // "living room lights" still means the group.
+        let states = vec![
+            Entity {
+                entity_id: "light.living_room_ceiling".into(),
+                state: "off".into(),
+                attributes: serde_json::json!({ "friendly_name": "Ceiling Light" }),
+            },
+            Entity {
+                entity_id: "light.living_room_floor_lamp".into(),
+                state: "off".into(),
+                attributes: serde_json::json!({ "friendly_name": "Floor Lamp" }),
+            },
+        ];
+        let areas = vec![AreaTemplateEntry {
+            id: "living_room".into(),
+            name: "Living Room".into(),
+            entities: vec![
+                "light.living_room_ceiling".into(),
+                "light.living_room_floor_lamp".into(),
+            ],
+        }];
+        let graph = HomeAssistantProvider::build_graph(&states, &areas);
+
+        let named = HomeAssistantProvider::resolve_target_in_graph(
+            &graph,
+            "living room floor lamp",
+            Some(HomeActionKind::TurnOn),
+        )
+        .expect("the named floor lamp should resolve");
+        assert_eq!(named.kind, HomeTargetKind::Entity);
+        assert_eq!(named.entity_ids, vec!["light.living_room_floor_lamp"]);
+
+        let group = HomeAssistantProvider::resolve_target_in_graph(
+            &graph,
+            "living room lights",
+            Some(HomeActionKind::TurnOn),
+        )
+        .expect("the bare room phrase should resolve to the group");
+        assert_eq!(group.kind, HomeTargetKind::Group);
+        assert_eq!(group.entity_ids.len(), 2);
     }
 
     #[test]
@@ -1788,5 +1934,56 @@ mod tests {
         assert_eq!(domain_label("sensor", 2), "devices");
         // The plural matches the whole-home label helper for the same domain.
         assert_eq!(domain_label("climate", 2), domain_plural_label("climate"));
+    }
+
+    /// Microbench for the `Arc<HomeGraph>` cache change: a cache hit used to
+    /// deep-clone the whole graph on every home request; now it is an
+    /// `Arc::clone`. Ignored by default (timing, not a correctness gate) — run
+    /// with `cargo test -p genie-core --release graph_clone_cost -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "microbench; run manually with --ignored --nocapture"]
+    fn graph_clone_cost_deep_vs_arc() {
+        // A ~200-entity, 20-area home — a large-but-plausible household.
+        let states: Vec<Entity> = (0..200)
+            .map(|i| Entity {
+                entity_id: format!("light.room_{i}"),
+                state: "off".into(),
+                attributes: serde_json::json!({ "friendly_name": format!("Room {i} Light") }),
+            })
+            .collect();
+        let areas: Vec<AreaTemplateEntry> = (0..20)
+            .map(|a| AreaTemplateEntry {
+                id: format!("area_{a}"),
+                name: format!("Area {a}"),
+                entities: (0..10)
+                    .map(|j| format!("light.room_{}", a * 10 + j))
+                    .collect(),
+            })
+            .collect();
+        let graph = HomeAssistantProvider::build_graph(&states, &areas);
+
+        const ITERS: usize = 10_000;
+        let start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(graph.clone());
+        }
+        let deep = start.elapsed();
+
+        let arc = std::sync::Arc::new(graph);
+        let start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(std::sync::Arc::clone(&arc));
+        }
+        let shared = start.elapsed();
+
+        println!(
+            "graph clone x{ITERS}: deep={deep:?}  arc={shared:?}  (~{}x faster)",
+            deep.as_nanos() / shared.as_nanos().max(1)
+        );
+        assert!(
+            shared < deep,
+            "Arc::clone must be cheaper than a deep clone"
+        );
     }
 }
