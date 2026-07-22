@@ -1163,17 +1163,14 @@ fn household_rule_store_request(text: &str) -> Option<String> {
 
 fn health_log_store_request(text: &str) -> Option<(&'static str, String)> {
     if text.starts_with("log that i drank ") && text.contains("water") {
-        let amount = text
-            .trim_start_matches("log that i drank ")
-            .trim_end_matches(" of water")
-            .trim_end_matches(" water")
-            .trim();
-        let content = if amount.is_empty() {
-            "hydration log: drank water".into()
-        } else {
-            format!("hydration log: drank {amount} of water")
-        };
-        return Some(("health_tracker", content));
+        // Preserve the spoken drank-phrase verbatim. The previous code stripped
+        // a trailing "water"/" of water" and re-appended " of water", which
+        // mangled anything that was not exactly "<quantity> of water": a bare
+        // "water" became "water of water", and "<descriptor> water" (e.g. "cold
+        // water") became "cold of water". Echoing the phrase yields the same
+        // output for the "<quantity> of water" forms and fixes the rest.
+        let drank = text.trim_start_matches("log that i drank ").trim();
+        return Some(("health_tracker", format!("hydration log: drank {drank}")));
     }
     if text == "log my weight"
         || text == "log my weight today"
@@ -2659,6 +2656,14 @@ fn timer_request(text: &str) -> Option<(u64, String)> {
     let label = reminder_label(&tokens, unit_end_index, reminder_style)
         .filter(|label| !label.is_empty())
         .or_else(|| extract_named_timer_label(&tokens, unit_end_index))
+        // A trailing "please" is politeness, not part of the label. Both label
+        // extractors leak it ("... for the pasta please" -> "pasta please",
+        // "... to check the pasta please" -> "check the pasta please"), so strip
+        // it once here where every extracted label converges. Done before the
+        // fallback so a bare "... for please" collapses to empty and still takes
+        // the generic default rather than the literal label "please".
+        .map(|label| label.trim_end_matches(" please").trim_end().to_string())
+        .filter(|label| !label.is_empty() && label != "please")
         .unwrap_or_else(|| {
             if text.starts_with("remind ") {
                 "reminder".into()
@@ -2809,10 +2814,23 @@ fn is_time_expression(location: &str) -> bool {
         return true;
     }
     // Numeric / vague durations ending in a time unit: "20 minutes", "an hour",
-    // "a few hours", "a couple days", "the next hour".
+    // "a few hours", "a couple days", "the next hour", "a month", "the weekend".
+    // The longer calendar units (month/year/weekend) belong here too: without
+    // them "in a month" / "on the weekend" read as a place or a room, so a rain
+    // query ("will it rain in a month") and a scheduled control ("turn on the
+    // lights in a month") both mishandled them — the same class the shorter
+    // day/week units already cover.
     matches!(
         location.split_whitespace().next_back(),
-        Some(last) if is_time_unit(last) || matches!(last, "day" | "days" | "week" | "weeks")
+        Some(last) if is_time_unit(last)
+            || matches!(
+                last,
+                "day" | "days"
+                    | "week" | "weeks"
+                    | "month" | "months"
+                    | "year" | "years"
+                    | "weekend" | "weekends"
+            )
     )
 }
 
@@ -2846,7 +2864,17 @@ fn weather_request(text: &str) -> Option<(String, bool)> {
 
     let location = extract_location_after_marker(text, " in ")
         .or_else(|| extract_location_after_marker(text, " for "))?;
-    if location.is_empty() || location == "today" || location == "tomorrow" {
+    // "what's the weather in the morning" / "... in an hour" names a *time*, not a
+    // place — the marker after "in"/"for" is a time expression, so there is no
+    // city to look up and the query must fall back to the default local forecast
+    // (grounded by the LLM). The rain path already guards this with
+    // is_time_expression; the general weather/forecast path only rejected the
+    // bare "today"/"tomorrow" and otherwise emitted get_weather{location:"morning"}.
+    if location.is_empty()
+        || location == "today"
+        || location == "tomorrow"
+        || is_time_expression(&location)
+    {
         return None;
     }
 
@@ -3117,21 +3145,30 @@ fn arithmetic_expression(text: &str) -> Option<String> {
     Some(expression.trim().to_string())
 }
 
-/// Convert standalone cardinal words to digits in a calculator expression, so
+/// Convert cardinal words to digits in a calculator expression, so
 /// "two plus two" -> "two + two" -> "2 + 2" (#532-adjacent: word-form arithmetic).
-/// Operator symbols and non-number words are left as-is; compound cardinals
-/// across multiple tokens are out of scope (rare in a calculation).
+/// A compound cardinal spans several tokens ("one hundred" -> 100, "ninety nine"
+/// -> 99); walk the tokens and let `parse_spoken_number` consume the whole span
+/// so it composes as one number rather than one digit per word ("one hundred /
+/// five" -> "100 / 5", not "1 100 / 5"). Operator symbols and non-number words
+/// parse as nothing and pass through unchanged; a bare digit token composes as
+/// itself, so digit expressions are untouched.
 fn words_to_digits(expression: &str) -> String {
-    expression
-        .split(' ')
-        .map(|token| {
-            super::number_words::parse_amount(token)
-                .filter(|value| value.fract() == 0.0)
-                .map(|value| (value as i64).to_string())
-                .unwrap_or_else(|| token.to_string())
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let tokens: Vec<&str> = expression.split(' ').collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if let Some((value, next)) = super::number_words::parse_spoken_number(&tokens, index)
+            && next > index
+        {
+            out.push(value.to_string());
+            index = next;
+        } else {
+            out.push(tokens[index].to_string());
+            index += 1;
+        }
+    }
+    out.join(" ")
 }
 
 fn parse_decimal_token(token: &str) -> Option<f64> {
@@ -4454,6 +4491,40 @@ mod tests {
     }
 
     #[test]
+    fn hydration_log_preserves_drank_phrase() {
+        // The strip-and-re-append logic turned a bare "water" into "water of
+        // water" and "<descriptor> water" into "<descriptor> of water".
+        for (utterance, content) in [
+            ("Log that I drank water", "hydration log: drank water"),
+            (
+                "Log that I drank cold water",
+                "hydration log: drank cold water",
+            ),
+            (
+                "Log that I drank sparkling water",
+                "hydration log: drank sparkling water",
+            ),
+            // Quantity forms are unchanged from before the fix.
+            (
+                "Log that I drank 2 glasses of water",
+                "hydration log: drank 2 glasses of water",
+            ),
+            (
+                "Log that I drank a bottle of water",
+                "hydration log: drank a bottle of water",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "memory_store", "{utterance:?}");
+            assert_eq!(
+                call.arguments["category"], "health_tracker",
+                "{utterance:?}"
+            );
+            assert_eq!(call.arguments["content"], content, "{utterance:?}");
+        }
+    }
+
+    #[test]
     fn routes_shopping_and_temperature_home_requests() {
         let call = route("Add milk and eggs to the shopping list").unwrap();
         assert_eq!(call.name, "memory_store");
@@ -5430,6 +5501,10 @@ mod tests {
             "turn off the fan in an hour",
             "turn on the lights in the evening",
             "turn on the bedroom lights in 10 minutes",
+            // Longer calendar durations are schedules too — is_time_expression
+            // now recognizes month/year/weekend, not just minutes/hours/days/weeks.
+            "turn on the lights in a month",
+            "turn off the fan in a year",
         ] {
             assert!(route(utterance).is_none(), "{utterance:?}");
         }
@@ -5689,6 +5764,33 @@ mod tests {
     }
 
     #[test]
+    fn routes_compound_spoken_cardinals_to_calculate() {
+        // A compound spoken cardinal ("one hundred", "ninety nine") spans several
+        // tokens. words_to_digits converted each token on its own, so "one
+        // hundred / five" became "1 100 / 5" — a garbled expression — instead of
+        // "100 / 5". Compose the span with the same parser the timer/amount paths
+        // use.
+        for (utterance, expression) in [
+            ("what is one hundred divided by five", "100 / 5"),
+            ("what is two hundred minus fifty", "200 - 50"),
+            ("what is one thousand divided by four", "1000 / 4"),
+            ("what is ninety nine plus one", "99 + 1"),
+            ("what is one hundred twenty plus five", "120 + 5"),
+            ("what is five hundred divided by ten", "500 / 10"),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "calculate", "{utterance:?}");
+            assert_eq!(call.arguments["expression"], expression, "{utterance:?}");
+        }
+
+        // Simple tens and digit forms are unchanged.
+        let call = route("what is twenty plus thirty").unwrap();
+        assert_eq!(call.arguments["expression"], "20 + 30");
+        let call = route("what is 100 divided by 5").unwrap();
+        assert_eq!(call.arguments["expression"], "100 / 5");
+    }
+
+    #[test]
     fn routes_weather_and_home_status_before_memory_recall() {
         let call = route("Jared: Is it raining for school pickup?").unwrap();
         assert_eq!(call.name, "get_weather");
@@ -5824,6 +5926,34 @@ mod tests {
 
         // No trailing label -> still the generic default (unchanged).
         let call = route("set a timer for 5 minutes").unwrap();
+        assert_eq!(call.arguments["label"], "timer");
+    }
+
+    #[test]
+    fn timer_label_drops_a_trailing_please() {
+        // A trailing "please" is politeness, not part of the label. Both label
+        // paths that reach the timer label leaked it: the "for <label>" form via
+        // clean_timer_label and the "to <task>" form via label_after_duration.
+        for (utterance, label) in [
+            ("set a timer for 10 minutes for the pasta please", "pasta"),
+            ("set a timer for 5 minutes for the eggs please", "eggs"),
+            ("set a 3 minute timer for the tea please", "tea"),
+            (
+                "set a timer for 10 minutes to check the pasta please",
+                "check the pasta",
+            ),
+        ] {
+            let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
+            assert_eq!(call.name, "set_timer", "{utterance:?}");
+            assert_eq!(call.arguments["label"], label, "{utterance:?}");
+        }
+
+        // A label that merely ends in those letters is untouched (whole word).
+        let call = route("set a timer for 10 minutes for the pleasantries").unwrap();
+        assert_eq!(call.arguments["label"], "pleasantries");
+
+        // A bare "... please" with no real label still falls to the default.
+        let call = route("set a timer for 10 minutes for please").unwrap();
         assert_eq!(call.arguments["label"], "timer");
     }
 
@@ -6197,6 +6327,30 @@ mod tests {
     }
 
     #[test]
+    fn weather_time_of_day_is_not_a_location() {
+        // "what's the weather in the morning" / "... in an hour" names a time,
+        // not a place — it must abstain (default local forecast via the LLM), not
+        // emit get_weather{location:"morning"}. The rain path already guarded
+        // this; the general weather/forecast path did not.
+        for utterance in [
+            "what's the weather in the morning",
+            "what's the weather in the evening",
+            "what's the weather in an hour",
+            "what's the weather in 3 days",
+        ] {
+            assert!(
+                route(utterance).is_none(),
+                "{utterance:?} should abstain, not route a time as a place"
+            );
+        }
+
+        // A real city with a trailing time qualifier still routes to that city.
+        let call = route("what's the weather in Denver tonight").unwrap();
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments["location"], "denver");
+    }
+
+    #[test]
     fn weather_location_drops_trailing_please() {
         // A trailing "please" is politeness, not part of the city: the location
         // argument must be just the city, not "paris please". Mirrors the other
@@ -6263,6 +6417,9 @@ mod tests {
             "will it rain in an hour",
             "will it rain in 20 minutes",
             "will it rain in a bit",
+            // Longer calendar durations are time expressions too.
+            "will it rain in a month",
+            "will it rain in a year",
         ] {
             let call = route(utterance).unwrap_or_else(|| panic!("no route for {utterance:?}"));
             assert_eq!(call.name, "get_weather", "{utterance:?}");
